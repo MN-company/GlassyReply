@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Telegram Gmail‑AI Bot – v2.2  (2025‑07‑09)
-
-•  Google Gemini 1.5‑flash con streaming
-•  Pixel 1×1 HTML opzionale (ENABLE_PIXEL / PIXEL_BASE_URL)
-•  Risposta AI salvata → usata quando si preme “📨 Invia” o “💾 Bozza”
-•  Tastiera etichette paginata, allegati, forward, star/unstar, trash
-•  safe_edit(): niente più errori “Message is not modified”
-"""
-
 from __future__ import annotations
 
 import os
