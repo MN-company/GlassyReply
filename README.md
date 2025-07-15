@@ -1,4 +1,4 @@
-# GlassyReply
+![GLASSYREPLY.png](https://github.com/MN-company/GlassyReply/blob/f7143f3a0553dae4b8ea6affcb8d963fd10204b5/GLASSYREPLY.png)
 
 This bot connects to a Gmail account, monitors the inbox for new emails, and uses the Google Gemini API to generate draft replies. You can interact with your emails directly from a private Telegram chat, allowing you to send replies, save drafts, apply labels, forward messages, and more.
 
@@ -12,8 +12,7 @@ This bot connects to a Gmail account, monitors the inbox for new emails, and use
   - Apply Gmail labels.
   - Forward emails to predefined or custom addresses.
   - Download attachments.
-- **Customizable AI Prompts**: Reply to the bot's message to provide a custom prompt for the AI.
-- **Secure**: Uses OAuth2 for Gmail authentication and stores credentials locally.
+- **Customizable AI Prompts**: é possibile cambiare il prompt di sistema a livello di bot ma anche fare richieste per rifinire la risposta.
 
 ---
 
@@ -89,12 +88,16 @@ The bot uses the Gemini API for AI-generated replies.
 ```bash
 npx wrangler init pixel-worker
 ```
-3. Ora, sostituire i file di default con quelli già programmati da me
-4. Eseguire il deploy del worker e verrà resituito un URL
+3. Nella cartella 'src' inserire
+  - index.ts
+  - types.ts
+  - utils.ts
+4. Sostituisci il wrangler.toml originale con quello scaricato
+5. Eseguire il deploy del worker e verrà resituito un URL
 ```bash
 npx wrangler deploy
 ```
-5. L'URL andrà poi inserito nel file .env
+6. L'URL andrà poi inserito nel file .env
 
 
 ### 7. Create the Environment File
