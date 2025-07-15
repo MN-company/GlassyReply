@@ -9,7 +9,7 @@ import email
 import argparse
 import asyncio
 import html as ihtml
-import urllib.parse  # <— usato per l’URL del pixel
+import urllib.parse  
 from io import BytesIO
 from uuid import uuid4
 from typing import Optional, Dict, List
