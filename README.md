@@ -20,33 +20,28 @@ This bot connects to a Gmail account, monitors the inbox for new emails, and use
 ## Prerequisites
 
 - Python 3.8+
-- A Google Account
+- A Google Account (You have access to Gemini API for free)
 - A Telegram Account
+- [A Cloudfare account (free tier)](https://dash.cloudflare.com/login)
 
 ---
 
 ## Setup Instructions
 
-Follow these steps carefully to configure and run the bot.
 
 ### 1. Clone the Project
 
-First, get the code onto your local machine. If you're using Git, you can clone it. Otherwise, download the source files.
-
+```bash
+git clone https://github.com/MN-company/GlassyReply.git && cd GlassyReply
+```
 ### 2. Install Dependencies
-
-This project requires several Python libraries. A `requirements.txt` file is included to simplify installation. Open your terminal in the project directory and run:
-
 ```bash
 pip install -r requirements.txt
 ```
-
 ### 3. Configure Google Cloud & Gmail API
 
-The bot needs API access to read and send emails.
-
 1.  **Go to the Google Cloud Console**: [console.cloud.google.com](https://console.cloud.google.com/)
-2.  **Create a new project**: If you don't have one already, create a new project (e.g., "Telegram Bot").
+2.  **Create a new project**: Create a new project
 3.  **Enable the Gmail API**:
     - In the search bar, type "Gmail API" and select it.
     - Click the **Enable** button.
@@ -55,13 +50,13 @@ The bot needs API access to read and send emails.
     - Click **+ CREATE CREDENTIALS** and select **OAuth client ID**.
     - If prompted, configure the **OAuth consent screen**.
         - Select **External** and click **Create**.
-        - App name: `Gmail AI Bot` (or anything you like).
+        - App name: `GlassyReply` (or anything you like).
         - User support email: Your email address.
         - Developer contact information: Your email address.
         - Click **Save and Continue** through the Scopes and Test Users sections. You do not need to add test users for this to work.
     - Now, back on the Credentials page, create the OAuth client ID:
         - Application type: **Desktop app**.
-        - Name: `Gmail Bot Credentials` (or anything you like).
+        - Name: `GlassyReply Credentials` (or anything you like).
         - Click **Create**.
 5.  **Download Credentials File**:
     - A popup will show your Client ID and Secret. Click **DOWNLOAD JSON**.
@@ -84,10 +79,25 @@ The bot uses the Gemini API for AI-generated replies.
     - BotFather will give you a **token**. Copy it.
 2.  **Get your Telegram Chat ID**:
     - The bot is designed to work in a private chat with you. You need your unique Chat ID.
-    - Search for the bot `@userinfobot` on Telegram and start a chat.
+    - Search for the bot `@RawDataBot` on Telegram and start a chat.
     - It will immediately send you a message containing your user information, including your **ID**. Copy it.
+  
+### 6. Enable Cloudfare Worker
+1. Open [A Cloudfare account (free tier)](https://dash.cloudflare.com/login)
+2. Nel terminale digita
 
-### 6. Create the Environment File
+```bash
+npx wrangler init pixel-worker
+```
+3. Ora, sostituire i file di default con quelli già programmati da me
+4. Eseguire il deploy del worker e verrà resituito un URL
+```bash
+npx wrangler deploy
+```
+5. L'URL andrà poi inserito nel file .env
+
+
+### 7. Create the Environment File
 
 The bot uses a `.env` file to store your secret keys and configuration.
 
