@@ -1,11 +1,11 @@
-name = "pixel"               # nome pubblico → pixel.<account>.workers.dev
-main = "src/index.ts"        # o src/index.ts se usi TypeScript
+name = "pixel"               
+main = "src/index.ts"       
 compatibility_date = "2025-07-08"
 workers_dev = true
 
 [[kv_namespaces]]
 binding = "PIXEL_LOG"
-id      = ""   # ← ID production
+id      = ""   
 
 TG_BOT_TOKEN = ""
 TG_CHAT_ID   = ""
