@@ -1,18 +1,23 @@
 ![GLASSYREPLY.png](https://github.com/MN-company/GlassyReply/blob/f7143f3a0553dae4b8ea6affcb8d963fd10204b5/GLASSYREPLY.png)
 
-This bot connects to a Gmail account, monitors the inbox for new emails, and uses the Google Gemini API to generate draft replies. You can interact with your emails directly from a private Telegram chat, allowing you to send replies, save drafts, apply labels, forward messages, and more.
+This is an email handling bot through Telegram inspired by hominom (official bot)[https://t.me/GmailBot]. The special feature compared to the official bot is the full and automatic integration of Gemini for response generation through artificial intelligence. The project is entirely replicable for free 
 
-## Features
+## Features.
+**Classic gmail features** 
+  - Star / unstar email
+  - Enter the ai's response in draft
+  - Send the ai's response
+  - Trash the email
+  - Add a tag to the email
+  - Forward the email
+**Extra functions**
+  - Generating responses automatically with the ai (Gemini API)
+  - Inserting a Pixel Tracker with proprietary server (with anti Mail Proxy Server filtering).
+**Filters and configurations**
+  - Anti generation filter based on email address (e.g., noreply)
+  - Tag-based anti generation filter ("update")
 
-- **Automatic Email Fetching**: Monitors your Gmail inbox and sends new emails to a Telegram chat.
-- **AI-Powered Replies**: Uses Google Gemini (you can choose which model you prefer) to automatically generate a draft reply for each new email.
-- **Interactive Controls**: Manage emails using Telegram's inline keyboard buttons:
-  - Send, Save as Draft, Trash, or Reject AI suggestion.
-  - Star or Unstar messages.
-  - Apply Gmail labels.
-  - Forward emails to predefined or custom addresses.
-  - Download attachments.
-- **Customizable AI Prompts**: é possibile cambiare il prompt di sistema a livello di bot ma anche fare richieste per rifinire la risposta.
+Translated with DeepL.com (free version)
 
 ---
 
@@ -22,6 +27,7 @@ This bot connects to a Gmail account, monitors the inbox for new emails, and use
 - A Google Account (You have access to Gemini API for free)
 - A Telegram Account
 - [A Cloudfare account (free tier)](https://dash.cloudflare.com/login)
+- [Node.js (npm)](https://github.com/npm/cli)
 
 ---
 
@@ -81,23 +87,25 @@ The bot uses the Gemini API for AI-generated replies.
     - Search for the bot `@RawDataBot` on Telegram and start a chat.
     - It will immediately send you a message containing your user information, including your **ID**. Copy it.
   
-### 6. Enable Cloudfare Worker
+### 6. Cloudfare worker activation.
 1. Open [A Cloudfare account (free tier)](https://dash.cloudflare.com/login)
-2. Nel terminale digita
+2. In the terminal, type.
 
-```bash
+``bash
 npx wrangler init pixel-worker
-```
-3. Nella cartella 'src' inserire
+``
+3. In the ‘src’ folder, enter
   - index.ts
   - types.ts
   - utils.ts
-4. Sostituisci il wrangler.toml originale con quello scaricato
-5. Eseguire il deploy del worker e verrà resituito un URL
-```bash
+4. Replace the original wrangler.toml with the one downloaded
+5. Deploy the worker and a URL will be resituated
+``bash
 npx wrangler deploy
-```
-6. L'URL andrà poi inserito nel file .env
+``
+6. The URL will then be placed in the .env file
+
+Translated with DeepL.com (free version)
 
 
 ### 7. Create the Environment File
