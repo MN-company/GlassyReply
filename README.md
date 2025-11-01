@@ -17,8 +17,6 @@ This is an email handling bot through Telegram inspired by hominom (official bot
   - Anti generation filter based on email address (e.g., noreply)
   - Tag-based anti generation filter ("update")
 
-Translated with DeepL.com (free version)
-
 ---
 
 ## Prerequisites
