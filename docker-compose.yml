@@ -1,0 +1,12 @@
+services:
+  glassyreply:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["python", "tg_email.py", "--mode", "polling"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+

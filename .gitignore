@@ -1,0 +1,16 @@
+.env
+.env.*
+.pytest_cache/
+.ruff_cache/
+.wrangler/
+node_modules/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+*.log
+.DS_Store
+data/
+output/
+token.json
+credentials.json

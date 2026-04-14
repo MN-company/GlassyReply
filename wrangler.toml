@@ -1,11 +1,4 @@
-name = "pixel"               
-main = "src/index.ts"       
-compatibility_date = "2025-07-08"
+name = "glassyreply-pixel"
+main = "src/index.ts"
+compatibility_date = "2025-07-05"
 workers_dev = true
-
-[[kv_namespaces]]
-binding = "PIXEL_LOG"
-id      = ""   
-
-TG_BOT_TOKEN = ""
-TG_CHAT_ID   = ""
