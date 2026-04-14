@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,12 +9,18 @@ from types import SimpleNamespace
 from googleapiclient.errors import HttpError
 
 from tg_email import (
+    Runtime,
     Config,
     ConfigError,
     EmailState,
     GmailClient,
     StateStore,
+    build_candidate_config,
+    build_application,
+    create_web_app,
+    make_dashboard_token,
     is_authorized_update,
+    verify_dashboard_token,
 )
 
 
@@ -88,6 +95,17 @@ class StateStoreTests(unittest.TestCase):
             self.assertIsNone(store.get_pending_action(202))
             store.close()
 
+    def test_app_settings_crud(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = StateStore(Path(tmpdir) / "state.db")
+            store.set_app_setting("LANG", "en")
+            store.set_app_setting("WATCH_INTERVAL", "42")
+            self.assertEqual(store.get_app_settings()["LANG"], "en")
+            self.assertEqual(store.get_app_settings()["WATCH_INTERVAL"], "42")
+            store.delete_app_setting("LANG")
+            self.assertNotIn("LANG", store.get_app_settings())
+            store.close()
+
 
 class AuthGuardTests(unittest.TestCase):
     def test_authorized_user_matches_chat_id(self) -> None:
@@ -111,6 +129,93 @@ class AuthGuardTests(unittest.TestCase):
         )
         update = SimpleNamespace(effective_user=SimpleNamespace(id=999))
         self.assertFalse(is_authorized_update(update, cfg))
+
+
+class DashboardAuthTests(unittest.TestCase):
+    def test_dashboard_token_roundtrip(self) -> None:
+        cfg = Config.from_env(
+            {
+                "TELEGRAM_BOT_TOKEN": "token",
+                "TELEGRAM_CHAT_ID": "123",
+                "GOOGLE_API_KEY": "gemini",
+            }
+        )
+        token = make_dashboard_token(cfg)
+        self.assertTrue(verify_dashboard_token(cfg, token))
+        self.assertFalse(verify_dashboard_token(cfg, token + "x"))
+
+
+class DashboardConfigTests(unittest.TestCase):
+    def test_candidate_config_rejects_invalid_pixel_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Config.from_env(
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "TELEGRAM_CHAT_ID": "123",
+                    "GOOGLE_API_KEY": "gemini",
+                    "DATA_DIR": tmpdir,
+                }
+            )
+            runtime = Runtime(
+                base_config=cfg,
+                config=cfg,
+                startup_overrides={},
+                store=StateStore(Path(tmpdir) / "state.db"),
+                gmail=SimpleNamespace(),
+                model=SimpleNamespace(),
+                shutdown_event=SimpleNamespace(),
+                mode="polling",
+            )
+            try:
+                with self.assertRaises(ConfigError):
+                    build_candidate_config(runtime, {"ENABLE_PIXEL": "1"})
+            finally:
+                runtime.store.close()
+
+
+class WebAppSmokeTests(unittest.TestCase):
+    def test_root_and_dashboard_auth(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cfg = Config.from_env(
+                    {
+                        "TELEGRAM_BOT_TOKEN": "token",
+                        "TELEGRAM_CHAT_ID": "123",
+                        "GOOGLE_API_KEY": "gemini",
+                        "DATA_DIR": tmpdir,
+                        "STATE_DB_PATH": str(Path(tmpdir) / "state.db"),
+                        "GMAIL_TOKEN_PATH": str(Path(tmpdir) / "token.json"),
+                        "GMAIL_CREDENTIALS_PATH": str(Path(tmpdir) / "credentials.json"),
+                    }
+                )
+                store = StateStore(cfg.state_db_path)
+                runtime = Runtime(
+                    base_config=cfg,
+                    config=cfg,
+                    startup_overrides={},
+                    store=store,
+                    gmail=GmailClient(cfg, service_factory=lambda: SimpleNamespace()),
+                    model=SimpleNamespace(),
+                    shutdown_event=asyncio.Event(),
+                    mode="polling",
+                )
+                app = build_application(runtime)
+                web = create_web_app(runtime, app)
+                client = web.test_client()
+
+                root = await client.get("/")
+                health = await client.get("/healthz")
+                unauth = await client.get("/dashboard")
+                token = make_dashboard_token(cfg)
+                auth = await client.get(f"/dashboard?token={token}")
+
+                self.assertEqual(root.status_code, 200)
+                self.assertEqual(health.status_code, 200)
+                self.assertEqual(unauth.status_code, 401)
+                self.assertEqual(auth.status_code, 200)
+                store.close()
+
+        asyncio.run(run())
 
 
 class GmailClientTests(unittest.TestCase):

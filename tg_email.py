@@ -14,7 +14,7 @@ import re
 import signal
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header
 from email.utils import parseaddr
@@ -66,6 +66,7 @@ DEFAULT_PROMPT = (
     "educata, chiara e concisa all'e-mail seguente. Includi saluti "
     "e firma se opportuno."
 )
+DASHBOARD_TOKEN_TTL_SECONDS = 24 * 60 * 60
 
 
 class ConfigError(RuntimeError):
@@ -86,11 +87,38 @@ def parse_bool(raw: str | None, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def parse_int(raw: str | None, default: int) -> int:
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    return int(raw)
+
+
+def parse_list(raw: str | None, default: List[str]) -> List[str]:
+    if raw is None:
+        return list(default)
+    raw = raw.strip()
+    if not raw:
+        return list(default)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            items = [str(item).strip() for item in parsed if str(item).strip()]
+            return items
+    except json.JSONDecodeError:
+        pass
+    items = [item.strip() for item in re.split(r"[,\n]+", raw) if item.strip()]
+    return items or list(default)
+
+
 @dataclass(slots=True)
 class Config:
     bot_token: str
     chat_id: int
     google_api_key: str
+    public_base_url: str
     data_dir: Path
     state_db_path: Path
     gmail_token_path: Path
@@ -103,6 +131,11 @@ class Config:
     pixel_webhook_url: str
     host: str
     port: int
+    watch_interval: int
+    lang: str
+    ai_model: str
+    predef_fwd: List[str]
+    state_retention_days: int
     telegram_webhook_url: str
     telegram_webhook_secret: str
 
@@ -114,11 +147,17 @@ class Config:
         bot_token = source.get("TELEGRAM_BOT_TOKEN", "").strip()
         chat_id_raw = source.get("TELEGRAM_CHAT_ID", "").strip()
         google_api_key = source.get("GOOGLE_API_KEY", "").strip()
+        fly_app_name = source.get("FLY_APP_NAME", "").strip()
         try:
             chat_id = int(chat_id_raw)
         except ValueError as exc:
             raise ConfigError("TELEGRAM_CHAT_ID must be integer") from exc
 
+        public_base_url = source.get("PUBLIC_BASE_URL", "").strip()
+        if not public_base_url:
+            public_base_url = (
+                f"https://{fly_app_name}.fly.dev" if fly_app_name else "http://127.0.0.1:8080"
+            )
         data_dir = Path(source.get("DATA_DIR") or (Path.cwd() / "data"))
         state_db_path = Path(source.get("STATE_DB_PATH") or (data_dir / "state.db"))
         gmail_token_path = Path(source.get("GMAIL_TOKEN_PATH") or (data_dir / "token.json"))
@@ -133,6 +172,11 @@ class Config:
         pixel_webhook_url = source.get("PIXEL_WEBHOOK_URL", "").strip()
         host = source.get("HOST", "0.0.0.0").strip() or "0.0.0.0"
         port_raw = source.get("PORT", "8080").strip()
+        watch_interval_raw = source.get("WATCH_INTERVAL", "15").strip()
+        lang = source.get("LANG", "it").strip() or "it"
+        ai_model = source.get("AI_MODEL", AI_MODEL).strip() or AI_MODEL
+        predef_fwd = parse_list(source.get("PREDEF_FWD"), PREDEF_FWD)
+        state_retention_days_raw = source.get("STATE_RETENTION_DAYS", str(STATE_RETENTION_DAYS)).strip()
         telegram_webhook_url = source.get("TELEGRAM_WEBHOOK_URL", "").strip()
         telegram_webhook_secret = source.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
@@ -150,11 +194,20 @@ class Config:
             raise ConfigError("ENABLE_PIXEL=true requires PIXEL_BASE_URL")
         if enable_pixel and not pixel_webhook_secret:
             raise ConfigError("ENABLE_PIXEL=true requires PIXEL_WEBHOOK_SECRET")
+        try:
+            watch_interval = int(watch_interval_raw)
+        except ValueError as exc:
+            raise ConfigError("WATCH_INTERVAL must be integer") from exc
+        try:
+            state_retention_days = int(state_retention_days_raw)
+        except ValueError as exc:
+            raise ConfigError("STATE_RETENTION_DAYS must be integer") from exc
 
         return cls(
             bot_token=bot_token,
             chat_id=chat_id,
             google_api_key=google_api_key,
+            public_base_url=public_base_url,
             data_dir=data_dir,
             state_db_path=state_db_path,
             gmail_token_path=gmail_token_path,
@@ -167,6 +220,11 @@ class Config:
             pixel_webhook_url=pixel_webhook_url,
             host=host,
             port=port,
+            watch_interval=watch_interval,
+            lang=lang,
+            ai_model=ai_model,
+            predef_fwd=predef_fwd,
+            state_retention_days=state_retention_days,
             telegram_webhook_url=telegram_webhook_url,
             telegram_webhook_secret=telegram_webhook_secret,
         )
@@ -196,6 +254,21 @@ class Config:
         self.gmail_token_path.write_text(content)
 
     def validate_mode(self, mode: str) -> None:
+        self.validate_effective(mode)
+
+    def validate_effective(self, mode: str | None = None) -> None:
+        if self.chat_id <= 0:
+            raise ConfigError("TELEGRAM_CHAT_ID must be > 0")
+        if self.port <= 0:
+            raise ConfigError("PORT must be > 0")
+        if self.watch_interval <= 0:
+            raise ConfigError("WATCH_INTERVAL must be > 0")
+        if self.state_retention_days <= 0:
+            raise ConfigError("STATE_RETENTION_DAYS must be > 0")
+        if self.enable_pixel and not self.pixel_base_url:
+            raise ConfigError("ENABLE_PIXEL=true requires PIXEL_BASE_URL")
+        if self.enable_pixel and not self.pixel_webhook_secret:
+            raise ConfigError("ENABLE_PIXEL=true requires PIXEL_WEBHOOK_SECRET")
         if mode == "webhook":
             if not self.telegram_webhook_secret:
                 raise ConfigError("Webhook mode requires TELEGRAM_WEBHOOK_SECRET")
@@ -206,6 +279,63 @@ class Config:
         if self.telegram_webhook_url.endswith("/telegram/webhook"):
             return self.telegram_webhook_url
         return self.telegram_webhook_url.rstrip("/") + "/telegram/webhook"
+
+    def resolved_public_base_url(self) -> str:
+        return self.public_base_url.rstrip("/")
+
+    def with_overrides(self, overrides: Mapping[str, str]) -> "Config":
+        if not overrides:
+            return self
+
+        data = {
+            "enable_pixel": self.enable_pixel,
+            "pixel_base_url": self.pixel_base_url,
+            "pixel_webhook_secret": self.pixel_webhook_secret,
+            "pixel_webhook_url": self.pixel_webhook_url,
+            "host": self.host,
+            "port": self.port,
+            "watch_interval": self.watch_interval,
+            "lang": self.lang,
+            "ai_model": self.ai_model,
+            "predef_fwd": list(self.predef_fwd),
+            "state_retention_days": self.state_retention_days,
+            "public_base_url": self.public_base_url,
+            "telegram_webhook_url": self.telegram_webhook_url,
+            "telegram_webhook_secret": self.telegram_webhook_secret,
+        }
+
+        if "PUBLIC_BASE_URL" in overrides:
+            data["public_base_url"] = overrides["PUBLIC_BASE_URL"].strip() or data["public_base_url"]
+        if "ENABLE_PIXEL" in overrides:
+            data["enable_pixel"] = parse_bool(overrides["ENABLE_PIXEL"], data["enable_pixel"])
+        if "PIXEL_BASE_URL" in overrides:
+            data["pixel_base_url"] = overrides["PIXEL_BASE_URL"].strip()
+        if "PIXEL_WEBHOOK_SECRET" in overrides:
+            data["pixel_webhook_secret"] = overrides["PIXEL_WEBHOOK_SECRET"].strip()
+        if "PIXEL_WEBHOOK_URL" in overrides:
+            data["pixel_webhook_url"] = overrides["PIXEL_WEBHOOK_URL"].strip()
+        if "HOST" in overrides:
+            data["host"] = overrides["HOST"].strip() or data["host"]
+        if "PORT" in overrides:
+            data["port"] = parse_int(overrides["PORT"], data["port"])
+        if "WATCH_INTERVAL" in overrides:
+            data["watch_interval"] = parse_int(overrides["WATCH_INTERVAL"], data["watch_interval"])
+        if "LANG" in overrides:
+            data["lang"] = overrides["LANG"].strip() or data["lang"]
+        if "AI_MODEL" in overrides:
+            data["ai_model"] = overrides["AI_MODEL"].strip() or data["ai_model"]
+        if "PREDEF_FWD" in overrides:
+            data["predef_fwd"] = parse_list(overrides["PREDEF_FWD"], data["predef_fwd"])
+        if "STATE_RETENTION_DAYS" in overrides:
+            data["state_retention_days"] = parse_int(
+                overrides["STATE_RETENTION_DAYS"], data["state_retention_days"]
+            )
+        if "TELEGRAM_WEBHOOK_URL" in overrides:
+            data["telegram_webhook_url"] = overrides["TELEGRAM_WEBHOOK_URL"].strip()
+        if "TELEGRAM_WEBHOOK_SECRET" in overrides:
+            data["telegram_webhook_secret"] = overrides["TELEGRAM_WEBHOOK_SECRET"].strip()
+
+        return replace(self, **data)
 
 
 @dataclass(slots=True)
@@ -301,6 +431,12 @@ class StateStore:
                 );
 
                 CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS app_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT,
                     updated_at TEXT NOT NULL
@@ -437,6 +573,26 @@ class StateStore:
                 (key,),
             ).fetchone()
         return row["value"] if row else None
+
+    def set_app_setting(self, key: str, value: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (key, value, utcnow_iso()),
+            )
+
+    def delete_app_setting(self, key: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM app_settings WHERE key = ?", (key,))
+
+    def get_app_settings(self) -> Dict[str, str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT key, value FROM app_settings ORDER BY key").fetchall()
+        return {row["key"]: row["value"] or "" for row in rows}
 
     def close(self) -> None:
         with self._lock:
@@ -612,12 +768,25 @@ class GmailClient:
 
 @dataclass(slots=True)
 class Runtime:
+    base_config: Config
     config: Config
+    startup_overrides: Dict[str, str]
     store: StateStore
     gmail: GmailClient
     model: Any
     shutdown_event: asyncio.Event
     mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardField:
+    key: str
+    attr: str
+    label: str
+    kind: str
+    help_text: str = ""
+    secret: bool = False
+    restart_required: bool = False
 
 
 def decode_hdr(value: str | None) -> str:
@@ -742,6 +911,11 @@ def b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
 
 
+def b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
 def make_tracking_token(config: Config, tg_message_id: int) -> str:
     payload = b64url_encode(
         json.dumps(
@@ -757,6 +931,92 @@ def make_tracking_token(config: Config, tg_message_id: int) -> str:
         ).digest()
     )
     return f"{payload}.{signature}"
+
+
+def make_dashboard_token(config: Config) -> str:
+    now = int(utcnow().timestamp())
+    payload = {
+        "chat_id": config.chat_id,
+        "iat": now,
+        "exp": now + DASHBOARD_TOKEN_TTL_SECONDS,
+        "nonce": uuid4().hex,
+    }
+    encoded = b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+    signature = b64url_encode(
+        hmac.new(config.bot_token.encode(), encoded.encode(), hashlib.sha256).digest()
+    )
+    return f"{encoded}.{signature}"
+
+
+def verify_dashboard_token(config: Config, token: str | None) -> bool:
+    if not token or "." not in token:
+        return False
+    try:
+        payload_part, signature_part = token.rsplit(".", 1)
+        expected = b64url_encode(
+            hmac.new(config.bot_token.encode(), payload_part.encode(), hashlib.sha256).digest()
+        )
+        if not hmac.compare_digest(expected, signature_part):
+            return False
+        payload = json.loads(b64url_decode(payload_part))
+        if int(payload.get("chat_id", 0)) != config.chat_id:
+            return False
+        if int(payload.get("exp", 0)) < int(utcnow().timestamp()):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def dashboard_url(config: Config) -> str:
+    return f"{config.resolved_public_base_url()}/dashboard?token={make_dashboard_token(config)}"
+
+
+def apply_runtime_overrides(runtime: Runtime) -> None:
+    overrides = runtime.store.get_app_settings()
+    merged = runtime.base_config.with_overrides(runtime.startup_overrides).with_overrides(overrides)
+    merged.validate_effective(runtime.mode)
+    runtime.config = merged
+    runtime.model = genai.GenerativeModel(runtime.config.ai_model)
+
+
+def build_candidate_config(runtime: Runtime, overrides: Mapping[str, str]) -> Config:
+    candidate = runtime.base_config.with_overrides(runtime.startup_overrides).with_overrides(overrides)
+    candidate.validate_effective(runtime.mode)
+    return candidate
+
+
+def sync_dashboard_overrides(runtime: Runtime, overrides: Mapping[str, str]) -> None:
+    editable_keys = {field.key for field in EDITABLE_DASHBOARD_FIELDS}
+    current = runtime.store.get_app_settings()
+    for key in editable_keys:
+        if key in overrides:
+            if current.get(key) != overrides[key]:
+                runtime.store.set_app_setting(key, overrides[key])
+        elif key in current:
+            runtime.store.delete_app_setting(key)
+    apply_runtime_overrides(runtime)
+
+
+def parse_dashboard_overrides(form_data: Mapping[str, Any], current: Mapping[str, str]) -> Dict[str, str]:
+    overrides = dict(current)
+    for field in EDITABLE_DASHBOARD_FIELDS:
+        raw = form_data.get(field.key)
+        if field.kind == "checkbox":
+            overrides[field.key] = "1" if raw else "0"
+            continue
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if field.secret:
+            if text:
+                overrides[field.key] = text
+            continue
+        if text:
+            overrides[field.key] = text
+        else:
+            overrides.pop(field.key, None)
+    return overrides
 
 
 def build_tracking_markup(config: Config, state: EmailState) -> str:
@@ -787,6 +1047,543 @@ def build_tracking_markup(config: Config, state: EmailState) -> str:
         f"@font-face {{ font-family:'grtrack-{nonce}'; src:url('{font_url}') format('woff2'); font-style:normal; font-weight:400; }}"
         "</style>"
     )
+
+
+EDITABLE_DASHBOARD_FIELDS = [
+    DashboardField(
+        key="PUBLIC_BASE_URL",
+        attr="public_base_url",
+        label="Public base URL",
+        kind="text",
+        help_text="Used for dashboard links and externally visible URLs.",
+    ),
+    DashboardField(
+        key="ENABLE_PIXEL",
+        attr="enable_pixel",
+        label="Enable pixel tracker",
+        kind="checkbox",
+        help_text="Turns on outbound telemetry markup generation.",
+    ),
+    DashboardField(
+        key="PIXEL_BASE_URL",
+        attr="pixel_base_url",
+        label="Pixel base URL",
+        kind="text",
+        help_text="Cloudflare Worker or other tracking endpoint base URL.",
+    ),
+    DashboardField(
+        key="PIXEL_WEBHOOK_SECRET",
+        attr="pixel_webhook_secret",
+        label="Pixel webhook secret",
+        kind="password",
+        secret=True,
+        help_text="Shared secret used by the pixel capture endpoint.",
+    ),
+    DashboardField(
+        key="PIXEL_WEBHOOK_URL",
+        attr="pixel_webhook_url",
+        label="Pixel webhook URL",
+        kind="text",
+        help_text="External callback URL for pixel status events.",
+    ),
+    DashboardField(
+        key="HOST",
+        attr="host",
+        label="HTTP host",
+        kind="text",
+        restart_required=True,
+        help_text="The process binds to this host on startup.",
+    ),
+    DashboardField(
+        key="PORT",
+        attr="port",
+        label="HTTP port",
+        kind="number",
+        restart_required=True,
+        help_text="The process listens on this port on startup.",
+    ),
+    DashboardField(
+        key="WATCH_INTERVAL",
+        attr="watch_interval",
+        label="Watch interval (seconds)",
+        kind="number",
+        help_text="Polling delay between Gmail inbox checks.",
+    ),
+    DashboardField(
+        key="LANG",
+        attr="lang",
+        label="Reply language",
+        kind="text",
+        help_text="Language used for Gemini reply drafts.",
+    ),
+    DashboardField(
+        key="AI_MODEL",
+        attr="ai_model",
+        label="AI model",
+        kind="text",
+        help_text="Gemini model name used for reply generation.",
+    ),
+    DashboardField(
+        key="PREDEF_FWD",
+        attr="predef_fwd",
+        label="Preset forward addresses",
+        kind="textarea",
+        help_text="One address per line or comma-separated. Use [] to clear the list.",
+    ),
+    DashboardField(
+        key="STATE_RETENTION_DAYS",
+        attr="state_retention_days",
+        label="State retention days",
+        kind="number",
+        help_text="Rows older than this are purged from SQLite.",
+    ),
+    DashboardField(
+        key="TELEGRAM_WEBHOOK_URL",
+        attr="telegram_webhook_url",
+        label="Telegram webhook URL",
+        kind="text",
+        restart_required=True,
+        help_text="Base URL used when switching the bot to webhook mode.",
+    ),
+    DashboardField(
+        key="TELEGRAM_WEBHOOK_SECRET",
+        attr="telegram_webhook_secret",
+        label="Telegram webhook secret",
+        kind="password",
+        secret=True,
+        restart_required=True,
+        help_text="Secret token checked by the Telegram webhook route.",
+    ),
+]
+
+
+def mask_secret(value: str, keep: int = 4) -> str:
+    if not value:
+        return "missing"
+    if len(value) <= keep * 2:
+        return "set"
+    return f"{value[:keep]}…{value[-keep:]}"
+
+
+def shorten_text(value: str, limit: int = 100) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)] + "…"
+
+
+def field_display_value(field: DashboardField, value: Any) -> str:
+    if field.kind == "checkbox":
+        return "enabled" if bool(value) else "disabled"
+    if field.secret:
+        return "set" if value else "missing"
+    if field.key == "PREDEF_FWD":
+        if isinstance(value, list):
+            if not value:
+                return "unset"
+            preview = ", ".join(value[:3])
+            if len(value) > 3:
+                preview += f" (+{len(value) - 3} more)"
+            return shorten_text(preview)
+        return shorten_text(str(value))
+    if value is None or value == "":
+        return "unset"
+    return shorten_text(str(value))
+
+
+def render_status_badge(text: str, kind: str = "neutral") -> str:
+    return f'<span class="badge badge-{kind}">{ihtml.escape(text)}</span>'
+
+
+def render_setting_row(
+    label: str,
+    value: str,
+    source: str,
+    note: str = "",
+    *,
+    secret: bool = False,
+) -> str:
+    value_html = ihtml.escape(value)
+    note_html = f'<div class="note">{ihtml.escape(note)}</div>' if note else ""
+    source_badge = render_status_badge(source, "saved" if source == "saved" else "soft")
+    return (
+        '<div class="row">'
+        f"<div><strong>{ihtml.escape(label)}</strong>{note_html}</div>"
+        f"<div class=\"mono\">{value_html}</div>"
+        f"<div>{source_badge}</div>"
+        "</div>"
+    )
+
+
+def render_dashboard_table(rows: List[dict]) -> str:
+    body = "".join(
+        render_setting_row(
+            row["label"],
+            row["value"],
+            row["source"],
+            row.get("note", ""),
+            secret=row.get("secret", False),
+        )
+        for row in rows
+    )
+    return (
+        '<div class="table">'
+        '<div class="row head"><div>Setting</div><div>Value</div><div>Source</div></div>'
+        f"{body}"
+        "</div>"
+    )
+
+
+def build_runtime_rows(runtime: Runtime) -> List[dict]:
+    overrides = runtime.store.get_app_settings()
+    rows: List[dict] = []
+    for field in EDITABLE_DASHBOARD_FIELDS:
+        value = getattr(runtime.config, field.attr)
+        if field.key in overrides:
+            source = "saved"
+        elif field.key in runtime.startup_overrides:
+            source = "startup"
+        else:
+            source = "env/default"
+        rows.append(
+            {
+                "label": field.label,
+                "value": field_display_value(field, value),
+                "source": source,
+                "note": field.help_text + (" Restart required." if field.restart_required else ""),
+                "secret": field.secret,
+            }
+        )
+    return rows
+
+
+def build_bootstrap_rows(runtime: Runtime) -> List[dict]:
+    base = runtime.base_config
+    rows = [
+        {
+            "label": "Telegram bot token",
+            "value": mask_secret(base.bot_token),
+            "source": "env",
+            "note": "Required to talk to Telegram.",
+            "secret": True,
+        },
+        {
+            "label": "Telegram chat ID",
+            "value": str(base.chat_id),
+            "source": "env",
+            "note": "Only this user can control the bot.",
+        },
+        {
+            "label": "Google API key",
+            "value": "set" if base.google_api_key else "missing",
+            "source": "env",
+            "note": "Used for Gemini requests.",
+            "secret": True,
+        },
+        {
+            "label": "OAuth credentials JSON",
+            "value": "set" if base.google_oauth_credentials_json else "missing",
+            "source": "env",
+            "note": "Bootstrap client JSON for Gmail OAuth.",
+            "secret": True,
+        },
+        {
+            "label": "OAuth token JSON",
+            "value": "set" if base.google_oauth_token_json else "missing",
+            "source": "env",
+            "note": "Optional token bootstrap blob for first launch.",
+            "secret": True,
+        },
+        {
+            "label": "Gmail token file",
+            "value": "present" if base.gmail_token_path.exists() else "missing",
+            "source": "filesystem",
+            "note": "Refreshed token saved on disk.",
+        },
+        {
+            "label": "Gmail credentials file",
+            "value": "present" if base.gmail_credentials_path.exists() else "missing",
+            "source": "filesystem",
+            "note": "Desktop OAuth client JSON.",
+        },
+    ]
+    return rows
+
+
+def dashboard_page(
+    runtime: Runtime,
+    *,
+    title: str,
+    message: str = "",
+    errors: List[str] | None = None,
+    token: str = "",
+) -> str:
+    runtime_rows = render_dashboard_table(build_runtime_rows(runtime))
+    bootstrap_rows = render_dashboard_table(build_bootstrap_rows(runtime))
+    form_inputs: List[str] = []
+    for field in EDITABLE_DASHBOARD_FIELDS:
+        value = getattr(runtime.config, field.attr)
+        if field.kind == "checkbox":
+            checked = " checked" if bool(value) else ""
+            form_inputs.append(
+                f"""
+                <label class="field field-inline">
+                  <input type="checkbox" name="{field.key}" value="1"{checked}>
+                  <span>{ihtml.escape(field.label)}</span>
+                </label>
+                <div class="help">{ihtml.escape(field.help_text)}</div>
+                """
+            )
+            continue
+        if field.kind == "textarea":
+            current_value = "\n".join(value) if isinstance(value, list) else str(value if value is not None else "")
+            if field.secret:
+                current_value = ""
+            input_html = f'<textarea name="{field.key}" rows="3" placeholder="leave blank to keep current">{ihtml.escape(current_value)}</textarea>'
+        else:
+            input_type = "password" if field.secret else ("number" if field.kind == "number" else "text")
+            current_value = "" if field.secret else str(value if value is not None else "")
+            input_html = f'<input type="{input_type}" name="{field.key}" value="{ihtml.escape(current_value)}" placeholder="leave blank to keep current">'
+        restart_note = "Restart required." if field.restart_required else ""
+        form_inputs.append(
+            f"""
+            <label class="field">
+              <span>{ihtml.escape(field.label)}</span>
+              {input_html}
+              <div class="help">{ihtml.escape(field.help_text)} {ihtml.escape(restart_note)}</div>
+            </label>
+            """
+        )
+
+    message_html = f'<div class="flash flash-ok">{ihtml.escape(message)}</div>' if message else ""
+    error_html = ""
+    if errors:
+        error_html = "".join(f'<div class="flash flash-error">{ihtml.escape(err)}</div>' for err in errors)
+
+    form_html = "".join(form_inputs)
+    return f"""
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{ihtml.escape(title)}</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        --bg: #f3efe7;
+        --panel: rgba(255, 255, 255, 0.82);
+        --text: #1f2328;
+        --muted: #667085;
+        --border: rgba(31, 35, 40, 0.12);
+        --accent: #d97706;
+        --good: #0f766e;
+        --warn: #b45309;
+        --bad: #b91c1c;
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top left, rgba(217, 119, 6, 0.14), transparent 28%),
+                    radial-gradient(circle at bottom right, rgba(15, 118, 110, 0.10), transparent 24%),
+                    var(--bg);
+        color: var(--text);
+      }}
+      .wrap {{ max-width: 1160px; margin: 0 auto; padding: 32px 20px 56px; }}
+      .hero {{ padding: 28px; border: 1px solid var(--border); border-radius: 24px; background: var(--panel); backdrop-filter: blur(12px); box-shadow: 0 20px 60px rgba(15, 23, 42, 0.08); }}
+      h1 {{ margin: 0 0 8px; font-size: clamp(2rem, 3vw, 3rem); }}
+      .sub {{ color: var(--muted); margin: 0 0 16px; line-height: 1.6; }}
+      .chips {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0 0; }}
+      .badge {{ display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 6px 10px; font-size: 12px; font-weight: 700; letter-spacing: .02em; border: 1px solid var(--border); }}
+      .badge-neutral {{ background: #f8fafc; }}
+      .badge-saved {{ background: rgba(15, 118, 110, 0.10); color: var(--good); }}
+      .badge-soft {{ background: rgba(217, 119, 6, 0.10); color: var(--warn); }}
+      .grid {{ display: grid; grid-template-columns: 1.05fr .95fr; gap: 18px; margin-top: 18px; }}
+      .card {{ padding: 22px; border-radius: 22px; border: 1px solid var(--border); background: var(--panel); backdrop-filter: blur(10px); }}
+      .card h2 {{ margin: 0 0 14px; font-size: 1.2rem; }}
+      .table {{ display: grid; gap: 10px; }}
+      .row {{ display: grid; grid-template-columns: 1.35fr 1fr .6fr; gap: 12px; align-items: start; padding: 12px 14px; border: 1px solid var(--border); border-radius: 16px; background: rgba(255,255,255,0.58); }}
+      .row.head {{ background: transparent; border: none; padding-top: 0; font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: .08em; }}
+      .note {{ margin-top: 6px; color: var(--muted); font-size: 13px; line-height: 1.5; }}
+      .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-word; }}
+      .flash {{ padding: 12px 14px; border-radius: 14px; margin: 14px 0; border: 1px solid var(--border); }}
+      .flash-ok {{ background: rgba(15, 118, 110, 0.08); color: var(--good); }}
+      .flash-error {{ background: rgba(185, 28, 28, 0.08); color: var(--bad); }}
+      .form {{ display: grid; gap: 14px; }}
+      .field {{ display: grid; gap: 8px; }}
+      .field-inline {{ display: flex; align-items: center; gap: 10px; }}
+      .field input[type="text"], .field input[type="password"], .field input[type="number"], .field textarea {{
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 11px 13px;
+        background: rgba(255,255,255,0.78);
+        color: var(--text);
+        font: inherit;
+      }}
+      .field textarea {{ min-height: 88px; resize: vertical; }}
+      .help {{ color: var(--muted); font-size: 13px; line-height: 1.5; }}
+      .actions {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }}
+      .btn {{
+        appearance: none;
+        border: none;
+        background: linear-gradient(135deg, #b45309, #d97706);
+        color: white;
+        padding: 12px 16px;
+        border-radius: 14px;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }}
+      .btn.secondary {{ background: #111827; }}
+      .mini {{ font-size: 13px; color: var(--muted); line-height: 1.55; }}
+      .stack {{ display: grid; gap: 16px; }}
+      .split {{ display: grid; gap: 16px; }}
+      @media (max-width: 920px) {{
+        .grid {{ grid-template-columns: 1fr; }}
+        .row {{ grid-template-columns: 1fr; }}
+      }}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="hero">
+        <h1>{ihtml.escape(title)}</h1>
+        <p class="sub">GlassyReply status and configuration dashboard. Runtime settings are saved in SQLite; bootstrap secrets stay visible here only as status, not in cleartext.</p>
+        <div class="chips">
+          {render_status_badge(f"mode: {runtime.mode}", "neutral")}
+          {render_status_badge(f"watch: {runtime.config.watch_interval}s", "neutral")}
+          {render_status_badge(f"lang: {runtime.config.lang}", "neutral")}
+          {render_status_badge(f"model: {runtime.config.ai_model}", "neutral")}
+          {render_status_badge("pixel on" if runtime.config.enable_pixel else "pixel off", "saved" if runtime.config.enable_pixel else "soft")}
+        </div>
+      </div>
+      {message_html}
+      {error_html}
+      <div class="grid">
+        <div class="card">
+          <h2>Live runtime settings</h2>
+          <p class="mini">These values come from env plus SQLite overrides. Save changes to persist them without editing `.env`.</p>
+          {runtime_rows}
+        </div>
+        <div class="card">
+          <h2>Bootstrap status</h2>
+          <p class="mini">What is required for the app to start or talk to external services.</p>
+          {bootstrap_rows}
+        </div>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h2>Edit settings</h2>
+          <p class="mini">Leave a text field blank to keep the current value. Checkbox changes are saved immediately. Host/port changes are stored, but the running process still needs a restart to rebind.</p>
+          <form class="form" method="post" action="/dashboard?token={ihtml.escape(token)}">
+            <input type="hidden" name="token" value="{ihtml.escape(token)}">
+            {form_html}
+            <div class="actions">
+              <button class="btn" type="submit">Save configuration</button>
+              <a class="btn secondary" href="/healthz">Health check</a>
+            </div>
+          </form>
+        </div>
+        <div class="card">
+          <h2>How to open</h2>
+          <p class="mini">Use the Telegram command <code>/config</code> or <code>/dashboard</code> to receive a signed link. That keeps the page private without needing to edit env vars.</p>
+          <p class="mini">If you change Gmail bootstrap secrets or the bot token, restart the process so the new runtime files are re-materialized.</p>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
+"""
+
+
+def landing_page(runtime: Runtime) -> str:
+    return f"""
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GlassyReply</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        --bg: #f4efe4;
+        --panel: rgba(255,255,255,0.84);
+        --text: #1f2937;
+        --muted: #6b7280;
+        --border: rgba(31,41,55,0.12);
+        --good: #0f766e;
+        --warn: #b45309;
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top left, rgba(180, 83, 9, 0.16), transparent 32%),
+                    radial-gradient(circle at bottom right, rgba(15, 118, 110, 0.12), transparent 26%),
+                    var(--bg);
+        color: var(--text);
+      }}
+      .wrap {{ max-width: 1120px; margin: 0 auto; padding: 30px 18px 56px; }}
+      .hero {{ padding: 28px; border: 1px solid var(--border); border-radius: 24px; background: var(--panel); backdrop-filter: blur(10px); box-shadow: 0 20px 60px rgba(15,23,42,0.08); }}
+      h1 {{ margin: 0 0 8px; font-size: clamp(2rem, 4vw, 3rem); }}
+      .sub {{ margin: 0; color: var(--muted); line-height: 1.6; }}
+      .chips {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }}
+      .badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 6px 10px; font-size: 12px; font-weight: 700; border: 1px solid var(--border); }}
+      .badge-neutral {{ background: #f8fafc; }}
+      .badge-saved {{ background: rgba(15,118,110,0.10); color: var(--good); }}
+      .badge-soft {{ background: rgba(180,83,9,0.10); color: var(--warn); }}
+      .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 18px; }}
+      .card {{ padding: 22px; border-radius: 22px; border: 1px solid var(--border); background: var(--panel); backdrop-filter: blur(10px); }}
+      .card h2 {{ margin: 0 0 14px; font-size: 1.15rem; }}
+      .mini {{ color: var(--muted); line-height: 1.55; font-size: 14px; }}
+      .link {{ color: inherit; }}
+      @media (max-width: 920px) {{
+        .grid {{ grid-template-columns: 1fr; }}
+      }}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="hero">
+        <h1>GlassyReply</h1>
+        <p class="sub">Telegram Gmail assistant with SQLite-backed state, AI replies, and a protected config dashboard. The bot root is now a real landing page, not a 404.</p>
+        <div class="chips">
+          {render_status_badge(f"mode: {runtime.mode}", "neutral")}
+          {render_status_badge(f"watch: {runtime.config.watch_interval}s", "neutral")}
+          {render_status_badge(f"lang: {runtime.config.lang}", "neutral")}
+          {render_status_badge("pixel on" if runtime.config.enable_pixel else "pixel off", "saved" if runtime.config.enable_pixel else "soft")}
+        </div>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h2>What this page is</h2>
+          <p class="mini">This public landing page only proves the app is alive. The full configuration view lives behind the signed Telegram dashboard link.</p>
+          <p class="mini">Open Telegram and send <code>/config</code> or <code>/dashboard</code> to receive the private config page.</p>
+        </div>
+        <div class="card">
+          <h2>Open the dashboard</h2>
+          <p class="mini">Use the Telegram command <code>/config</code> or <code>/dashboard</code> to receive a signed link. That page is protected and lets you edit the saved runtime configuration without touching `.env`.</p>
+          <p class="mini"><a class="link" href="/healthz">/healthz</a> is the lightweight uptime check used by Fly.</p>
+        </div>
+        <div class="card">
+          <h2>Status</h2>
+          <p class="mini">If Gmail OAuth is missing or invalid, the bot will report it in logs instead of crashing silently.</p>
+        </div>
+        <div class="card">
+          <h2>Notes</h2>
+          <p class="mini">The detailed settings page stays private. That keeps runtime knobs and bootstrap secrets out of the public root response.</p>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
+"""
 
 
 def kb_main(tg_message_id: int, starred: bool, attachments: List[dict]) -> InlineKeyboardMarkup:
@@ -855,10 +1652,10 @@ def kb_att(tg_message_id: int, attachments: List[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def kb_fwd(tg_message_id: int) -> InlineKeyboardMarkup:
+def kb_fwd(config: Config, tg_message_id: int) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(address, callback_data=f"fwdto|{tg_message_id}|{address}")]
-        for address in PREDEF_FWD
+        for address in config.predef_fwd
     ]
     rows.append([InlineKeyboardButton("✉️ Altro…", callback_data=f"fwdother|{tg_message_id}")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"back|{tg_message_id}")])
@@ -953,14 +1750,30 @@ async def ai_reply_stream(
     final_text = accumulated[:TELEGRAM_MAX]
     state.ai_body = final_text
     runtime.store.update_ai_body(state.tg_message_id, final_text)
-    runtime.store.purge_old_rows()
+    runtime.store.purge_old_rows(runtime.config.state_retention_days)
     await safe_edit(progress, text=format_email_text(state, body_override=final_text))
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update, context):
         return
-    await update.effective_message.reply_text("Bot Gmail-AI pronto.")
+    await update.effective_message.reply_text(
+        "Bot Gmail-AI pronto. Usa /config o /dashboard per aprire la dashboard."
+    )
+
+
+async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update, context):
+        return
+    runtime = get_runtime(context.application)
+    url = dashboard_url(runtime.config)
+    await update.effective_message.reply_text(
+        "Dashboard pronta.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Open dashboard", url=url)]]
+        ),
+        disable_web_page_preview=True,
+    )
 
 
 async def txt_followup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1050,7 +1863,7 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_to_message_id=message.message_id,
         )
         runtime.store.add_pending_action(prompt_message.message_id, tg_message_id, "ask")
-        runtime.store.purge_old_rows()
+        runtime.store.purge_old_rows(runtime.config.state_retention_days)
         await query.answer()
         return
 
@@ -1095,7 +1908,7 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if action == "fwd":
-        await safe_edit(message, markup=kb_fwd(tg_message_id))
+        await safe_edit(message, markup=kb_fwd(runtime.config, tg_message_id))
         await query.answer()
         return
 
@@ -1112,7 +1925,7 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_to_message_id=message.message_id,
         )
         runtime.store.add_pending_action(prompt_message.message_id, tg_message_id, "forward")
-        runtime.store.purge_old_rows()
+        runtime.store.purge_old_rows(runtime.config.state_retention_days)
         await query.answer()
         return
 
@@ -1148,7 +1961,8 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer(f"Err: {exc}", show_alert=True)
 
 
-async def process_new_email(application: Application, runtime: Runtime, gmail_message_id: str, lang: str) -> None:
+async def process_new_email(application: Application, runtime: Runtime, gmail_message_id: str) -> None:
+    lang = runtime.config.lang
     payload = await asyncio.to_thread(runtime.gmail.get_full_message, gmail_message_id)
     message_payload = payload["payload"]
     headers = message_payload.get("headers", [])
@@ -1188,12 +2002,12 @@ async def process_new_email(application: Application, runtime: Runtime, gmail_me
         lang=lang,
     )
     runtime.store.upsert_email_state(state)
-    runtime.store.purge_old_rows()
+    runtime.store.purge_old_rows(runtime.config.state_retention_days)
     await safe_edit(tg_message, markup=kb_main(state.tg_message_id, state.starred, attachments))
     await ai_reply_stream(application, runtime, state, DEFAULT_PROMPT)
 
 
-async def watcher(runtime: Runtime, application: Application, interval: int, lang: str) -> None:
+async def watcher(runtime: Runtime, application: Application) -> None:
     last_seen = runtime.store.get_bot_state(LAST_SEEN_KEY)
     if not last_seen:
         try:
@@ -1210,12 +2024,13 @@ async def watcher(runtime: Runtime, application: Application, interval: int, lan
             if newest and newest != last_seen:
                 last_seen = newest
                 runtime.store.set_bot_state(LAST_SEEN_KEY, newest)
-                await process_new_email(application, runtime, newest, lang)
+                await process_new_email(application, runtime, newest)
         except asyncio.CancelledError:
             raise
         except Exception:
             LOGGER.exception("Watcher loop failed.")
         try:
+            interval = max(1, int(runtime.config.watch_interval))
             await asyncio.wait_for(runtime.shutdown_event.wait(), timeout=interval)
         except asyncio.TimeoutError:
             continue
@@ -1236,9 +2051,77 @@ async def on_err(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 def create_web_app(runtime: Runtime, application: Application) -> Quart:
     app = Quart(__name__)
 
+    def dashboard_token_from_request() -> str | None:
+        return request.args.get("token") or request.headers.get("X-Dashboard-Token")
+
+    async def require_dashboard_auth() -> tuple[bool, str | None]:
+        token = dashboard_token_from_request()
+        if verify_dashboard_token(runtime.config, token):
+            return True, token
+        return False, token
+
+    @app.get("/")
+    async def index():
+        return landing_page(runtime)
+
     @app.get("/healthz")
     async def healthz():
         return jsonify({"status": "ok", "mode": runtime.mode})
+
+    @app.get("/config")
+    @app.get("/dashboard")
+    async def dashboard_get():
+        authorized, token = await require_dashboard_auth()
+        if not authorized:
+            return (
+                "<h1>Unauthorized</h1><p>Use the Telegram command <code>/config</code> to "
+                "open a signed dashboard link.</p>",
+                401,
+            )
+        return dashboard_page(runtime, title="GlassyReply dashboard", token=token or "")
+
+    @app.post("/config")
+    @app.post("/dashboard")
+    async def dashboard_post():
+        form_data = await request.form
+        token = dashboard_token_from_request() or form_data.get("token")
+        if not verify_dashboard_token(runtime.config, token):
+            return (
+                "<h1>Unauthorized</h1><p>Use the Telegram command <code>/config</code> to "
+                "open a signed dashboard link.</p>",
+                401,
+            )
+        current_overrides = runtime.store.get_app_settings()
+        candidate_overrides = parse_dashboard_overrides(form_data, current_overrides)
+        try:
+            build_candidate_config(runtime, candidate_overrides)
+        except ConfigError as exc:
+            return (
+                dashboard_page(
+                    runtime,
+                    title="GlassyReply dashboard",
+                    token=token or "",
+                    errors=[str(exc)],
+                ),
+                400,
+            )
+
+        sync_dashboard_overrides(runtime, candidate_overrides)
+        try:
+            if runtime.mode == "webhook" and runtime.config.telegram_webhook_url:
+                await application.bot.set_webhook(
+                    url=runtime.config.resolved_telegram_webhook_url(),
+                    secret_token=runtime.config.telegram_webhook_secret,
+                    drop_pending_updates=False,
+                )
+        except Exception:
+            LOGGER.exception("Failed to refresh Telegram webhook after dashboard save.")
+        return dashboard_page(
+            runtime,
+            title="GlassyReply dashboard",
+            token=token or "",
+            message="Configuration saved.",
+        )
 
     @app.post("/pixel_status")
     async def pixel_status():
@@ -1346,6 +2229,8 @@ def build_application(runtime: Runtime) -> Application:
     )
     application.bot_data["runtime"] = runtime
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("config", cmd_dashboard))
+    application.add_handler(CommandHandler("dashboard", cmd_dashboard))
     application.add_handler(CallbackQueryHandler(cb_btn))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, txt_followup))
     application.add_error_handler(on_err)
@@ -1383,32 +2268,42 @@ async def shutdown_telegram(application: Application, runtime: Runtime, mode: st
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--interval", type=int, default=15)
-    parser.add_argument("--lang", default="it")
+    parser.add_argument("--interval", type=int, default=None)
+    parser.add_argument("--lang", default=None)
     parser.add_argument("--mode", choices=["polling", "webhook"], default="polling")
     return parser.parse_args()
 
 
 async def run(args: argparse.Namespace) -> None:
-    config = Config.from_env()
-    config.validate_mode(args.mode)
-    config.ensure_storage()
-    config.materialize_google_credentials()
+    base_config = Config.from_env()
+    startup_overrides: Dict[str, str] = {}
+    if args.interval is not None:
+        startup_overrides["WATCH_INTERVAL"] = str(args.interval)
+    if args.lang:
+        startup_overrides["LANG"] = args.lang
+    base_config.ensure_storage()
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    store = StateStore(config.state_db_path)
-    store.purge_old_rows()
+    store = StateStore(base_config.state_db_path)
+    stored_overrides = store.get_app_settings()
+    config = base_config.with_overrides(stored_overrides).with_overrides(startup_overrides)
+    config.validate_effective(args.mode)
+    config.materialize_google_credentials()
+    config.materialize_gmail_token()
+    store.purge_old_rows(config.state_retention_days)
 
     genai.configure(api_key=config.google_api_key)
     runtime = Runtime(
+        base_config=base_config,
         config=config,
+        startup_overrides=startup_overrides,
         store=store,
         gmail=GmailClient(config),
-        model=genai.GenerativeModel(AI_MODEL),
+        model=genai.GenerativeModel(config.ai_model),
         shutdown_event=asyncio.Event(),
         mode=args.mode,
     )
@@ -1428,7 +2323,7 @@ async def run(args: argparse.Namespace) -> None:
     try:
         await bootstrap_telegram(application, runtime, args.mode)
         http_task = asyncio.create_task(run_http_server(runtime, web_app))
-        watcher_task = asyncio.create_task(watcher(runtime, application, args.interval, args.lang))
+        watcher_task = asyncio.create_task(watcher(runtime, application))
         stop_task = asyncio.create_task(runtime.shutdown_event.wait())
 
         done, _ = await asyncio.wait(

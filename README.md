@@ -2,7 +2,7 @@
 
 GlassyReply is a Telegram bot for one-user Gmail triage and AI-assisted replies.
 
-It watches Gmail, forwards each new inbox message to Telegram, streams a Gemini draft reply, and lets you send, save draft, trash, star, label, forward, and download attachments from inline keyboards. It also exposes an optional multilayer tracking pipeline for outbound HTML replies.
+It watches Gmail, forwards each new inbox message to Telegram, streams a Gemini draft reply, and lets you send, save draft, trash, star, label, forward, and download attachments from inline keyboards. It also exposes a public landing page, a private Telegram-signed config dashboard, and an optional multilayer tracking pipeline for outbound HTML replies.
 
 ## Architecture
 
@@ -17,6 +17,7 @@ It watches Gmail, forwards each new inbox message to Telegram, streams a Gemini 
 | Telegram App | <-> | GlassyReply Python bot | <--> | Gemini API       |
 +-------------+     | tg_email.py             |      +------------------+
                     | SQLite state + Quart    |
+                    | / landing + dashboard    |
                     +-----+--------------+----+
                           |              |
                /pixel_status webhook     | optional outbound tracking HTML
@@ -33,6 +34,7 @@ It watches Gmail, forwards each new inbox message to Telegram, streams a Gemini 
 - Gmail API calls now self-heal on `401/403` by rebuilding the client and retrying once.
 - Telegram access is locked to the configured owner user ID.
 - Configuration is centralized in `Config.from_env()`.
+- Runtime config is persisted in SQLite and edited from the dashboard, not by hand in `.env`.
 - Bot runtime supports `--mode polling` and `--mode webhook`.
 - Docker, Docker Compose, Fly.io config, tests, and first-run docs were added.
 - Pixel tracking moved from a single raw image URL to a signed multilayer bundle:
@@ -71,6 +73,8 @@ Required values:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `GOOGLE_API_KEY`
+
+The dashboard can edit the runtime knobs later, but these bootstrap values still need to be present at startup.
 
 Recommended local paths:
 
@@ -111,20 +115,34 @@ What happens:
 
 If you already have a working local `token.json`, you can also bootstrap remote hosts with `GOOGLE_OAUTH_TOKEN_JSON`. The app writes it only when the token file is missing, so later refreshes still persist to disk.
 
+### 5. Open the dashboard
+
+After the bot is running, send `/config` or `/dashboard` to the Telegram bot.
+
+It replies with a signed link to the private dashboard where you can:
+
+- inspect which settings are saved in SQLite
+- change runtime settings without editing `.env`
+- keep the live bot config aligned across restarts
+
+The link is signed and time-limited, so you can ask the bot for a fresh one whenever you need it.
+
 ## Running locally
 
 ### Polling mode
 
 ```bash
-python3 tg_email.py --mode polling --interval 15 --lang it
+python3 tg_email.py --mode polling
 ```
+
+`--interval` and `--lang` are optional startup overrides. The dashboard-saved values win for normal operation.
 
 ### Webhook mode
 
 Use webhook mode only when the bot is reachable from Telegram:
 
 ```bash
-python3 tg_email.py --mode webhook --lang it
+python3 tg_email.py --mode webhook
 ```
 
 You must set:
@@ -176,11 +194,12 @@ flyctl secrets set \
   TELEGRAM_BOT_TOKEN=... \
   TELEGRAM_CHAT_ID=... \
   GOOGLE_API_KEY=... \
-  PIXEL_WEBHOOK_SECRET=... \
   GOOGLE_OAUTH_CREDENTIALS_JSON="$(cat credentials.json)" \
   GOOGLE_OAUTH_TOKEN_JSON="$(cat data/token.json)" \
   --app glassyreply-bot
 ```
+
+You can leave pixel and other runtime knobs for the dashboard after the app is live.
 
 ### 3. Bootstrap `token.json`
 
@@ -202,6 +221,8 @@ On first boot, the container writes the token into `/app/data/token.json`. After
 Fly checks:
 
 - `GET /healthz`
+- `GET /` public landing page
+- `GET /dashboard?token=...` private dashboard
 
 ## Pixel tracker
 
