@@ -1268,6 +1268,20 @@ def clear_google_oauth_state(runtime: Runtime) -> None:
     runtime.store.set_bot_state(GOOGLE_OAUTH_STATE_KEY, "")
 
 
+def google_oauth_state_payload(state: str, code_verifier: str | None) -> str:
+    payload = {"state": state, "created_at": utcnow_iso()}
+    if code_verifier:
+        payload["code_verifier"] = code_verifier
+    return json.dumps(payload)
+
+
+def parse_google_oauth_state_payload(raw: str) -> dict:
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or not payload.get("state"):
+        raise ConfigError("Google OAuth state payload is invalid.")
+    return payload
+
+
 def start_google_oauth(runtime: Runtime) -> str:
     client_config = google_web_client_config(runtime.config)
     flow = Flow.from_client_config(
@@ -1280,8 +1294,10 @@ def start_google_oauth(runtime: Runtime) -> str:
         include_granted_scopes="true",
         prompt="consent",
     )
-    payload = {"state": state, "created_at": utcnow_iso()}
-    runtime.store.set_bot_state(GOOGLE_OAUTH_STATE_KEY, json.dumps(payload))
+    runtime.store.set_bot_state(
+        GOOGLE_OAUTH_STATE_KEY,
+        google_oauth_state_payload(state, getattr(flow, "code_verifier", None)),
+    )
     return auth_url
 
 
@@ -2713,12 +2729,15 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
         if not state_payload_raw:
             return "<h1>OAuth state missing</h1><p>Restart the Gmail login from Telegram.</p>", 400
         try:
-            state_payload = json.loads(state_payload_raw)
+            state_payload = parse_google_oauth_state_payload(state_payload_raw)
             expected_state = state_payload["state"]
         except Exception:
             return "<h1>OAuth state invalid</h1><p>Restart the Gmail login from Telegram.</p>", 400
         if request.args.get("state") != expected_state:
             return "<h1>OAuth state mismatch</h1><p>Restart the Gmail login from Telegram.</p>", 400
+        code_verifier = state_payload.get("code_verifier")
+        if not code_verifier:
+            return "<h1>OAuth state expired</h1><p>Restart the Gmail login from Telegram.</p>", 400
         try:
             client_config = google_web_client_config(runtime.config)
             flow = Flow.from_client_config(
@@ -2726,6 +2745,7 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
                 scopes=SCOPES,
                 state=expected_state,
                 redirect_uri=google_oauth_redirect_url(runtime.config),
+                code_verifier=code_verifier,
             )
             flow.fetch_token(
                 authorization_response=google_oauth_authorization_response(

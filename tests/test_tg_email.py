@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from googleapiclient.errors import HttpError
 
 from tg_email import (
+    GOOGLE_OAUTH_STATE_KEY,
     Runtime,
     Config,
     ConfigError,
@@ -19,13 +22,16 @@ from tg_email import (
     build_application,
     claim_owner,
     create_web_app,
+    google_oauth_state_payload,
     google_web_client_config,
     make_dashboard_token,
     owner_configured,
     is_authorized_update,
     google_oauth_authorization_response,
+    parse_google_oauth_state_payload,
     save_runtime_settings,
     split_unseen_inbox_ids,
+    start_google_oauth,
     startup_notice_text,
     verify_dashboard_token,
 )
@@ -237,6 +243,47 @@ class SelfHostedSetupTests(unittest.TestCase):
 
             shutil.rmtree(cfg.data_dir, ignore_errors=True)
 
+    def test_start_google_oauth_persists_code_verifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Config.from_env(
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "PUBLIC_BASE_URL": "https://glassyreply-bot.fly.dev",
+                    "GOOGLE_OAUTH_CREDENTIALS_JSON": '{"web":{"client_id":"x","project_id":"p","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","client_secret":"secret"}}',
+                    "DATA_DIR": tmpdir,
+                }
+            )
+            store = StateStore(Path(tmpdir) / "state.db")
+            runtime = Runtime(
+                base_config=cfg,
+                config=cfg,
+                startup_overrides={},
+                store=store,
+                gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+                model=None,
+                shutdown_event=SimpleNamespace(),
+                mode="polling",
+            )
+
+            class FakeFlow:
+                code_verifier = "pkce-verifier"
+
+                def authorization_url(self, **kwargs):
+                    return "https://accounts.google.com/auth?state=oauth-state", "oauth-state"
+
+            try:
+                with patch("tg_email.Flow.from_client_config", return_value=FakeFlow()) as mocked:
+                    auth_url = start_google_oauth(runtime)
+                self.assertIn("oauth-state", auth_url)
+                state_payload = parse_google_oauth_state_payload(
+                    store.get_bot_state(GOOGLE_OAUTH_STATE_KEY)
+                )
+                self.assertEqual(state_payload["state"], "oauth-state")
+                self.assertEqual(state_payload["code_verifier"], "pkce-verifier")
+                self.assertIn("redirect_uri", mocked.call_args.kwargs)
+            finally:
+                store.close()
+
     def test_startup_notice_text_reports_missing_setup(self) -> None:
         cfg = Config.from_env(
             {
@@ -387,6 +434,109 @@ class WebAppSmokeTests(unittest.TestCase):
                 self.assertEqual(unauth.status_code, 401)
                 self.assertEqual(auth.status_code, 200)
                 store.close()
+
+        asyncio.run(run())
+
+    def test_google_oauth_callback_uses_saved_code_verifier(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cfg = Config.from_env(
+                    {
+                        "TELEGRAM_BOT_TOKEN": "token",
+                        "PUBLIC_BASE_URL": "https://glassyreply-bot.fly.dev",
+                        "GOOGLE_OAUTH_CREDENTIALS_JSON": '{"web":{"client_id":"x","project_id":"p","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","client_secret":"secret"}}',
+                        "DATA_DIR": tmpdir,
+                    }
+                )
+                store = StateStore(Path(tmpdir) / "state.db")
+                runtime = Runtime(
+                    base_config=cfg,
+                    config=cfg,
+                    startup_overrides={},
+                    store=store,
+                    gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+                    model=None,
+                    shutdown_event=asyncio.Event(),
+                    mode="polling",
+                )
+                runtime.store.set_bot_state(
+                    GOOGLE_OAUTH_STATE_KEY,
+                    google_oauth_state_payload("oauth-state", "pkce-verifier"),
+                )
+                app = build_application(runtime)
+                web = create_web_app(runtime, app)
+                client = web.test_client()
+
+                class FakeCredentials:
+                    def to_json(self):
+                        return json.dumps({"refresh_token": "token-value"})
+
+                class FakeFlow:
+                    def __init__(self):
+                        self.credentials = FakeCredentials()
+                        self.authorization_response = None
+
+                    def fetch_token(self, authorization_response):
+                        self.authorization_response = authorization_response
+
+                fake_flow = FakeFlow()
+                try:
+                    with patch("tg_email.Flow.from_client_config", return_value=fake_flow) as mocked:
+                        response = await client.get("/oauth/google/callback?state=oauth-state&code=abc")
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(
+                        mocked.call_args.kwargs["code_verifier"],
+                        "pkce-verifier",
+                    )
+                    self.assertEqual(
+                        fake_flow.authorization_response,
+                        "https://glassyreply-bot.fly.dev/oauth/google/callback?state=oauth-state&code=abc",
+                    )
+                    self.assertEqual(
+                        store.get_app_settings()["GOOGLE_OAUTH_TOKEN_JSON"],
+                        json.dumps({"refresh_token": "token-value"}),
+                    )
+                finally:
+                    store.close()
+
+        asyncio.run(run())
+
+    def test_google_oauth_callback_rejects_missing_code_verifier(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cfg = Config.from_env(
+                    {
+                        "TELEGRAM_BOT_TOKEN": "token",
+                        "PUBLIC_BASE_URL": "https://glassyreply-bot.fly.dev",
+                        "GOOGLE_OAUTH_CREDENTIALS_JSON": '{"web":{"client_id":"x","project_id":"p","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","client_secret":"secret"}}',
+                        "DATA_DIR": tmpdir,
+                    }
+                )
+                store = StateStore(Path(tmpdir) / "state.db")
+                runtime = Runtime(
+                    base_config=cfg,
+                    config=cfg,
+                    startup_overrides={},
+                    store=store,
+                    gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+                    model=None,
+                    shutdown_event=asyncio.Event(),
+                    mode="polling",
+                )
+                runtime.store.set_bot_state(
+                    GOOGLE_OAUTH_STATE_KEY,
+                    json.dumps({"state": "oauth-state", "created_at": "2026-04-15T00:00:00+00:00"}),
+                )
+                app = build_application(runtime)
+                web = create_web_app(runtime, app)
+                client = web.test_client()
+                try:
+                    response = await client.get("/oauth/google/callback?state=oauth-state&code=abc")
+                    self.assertEqual(response.status_code, 400)
+                    body = (await response.get_data()).decode()
+                    self.assertIn("OAuth state expired", body)
+                finally:
+                    store.close()
 
         asyncio.run(run())
 
