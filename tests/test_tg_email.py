@@ -23,6 +23,7 @@ from tg_email import (
     make_dashboard_token,
     owner_configured,
     is_authorized_update,
+    google_oauth_authorization_response,
     save_runtime_settings,
     split_unseen_inbox_ids,
     startup_notice_text,
@@ -217,6 +218,24 @@ class SelfHostedSetupTests(unittest.TestCase):
                 self.assertEqual(loaded["web"]["client_id"], "x")
             finally:
                 runtime.store.close()
+
+    def test_google_oauth_authorization_response_uses_public_base_url(self) -> None:
+        cfg = Config.from_env(
+            {
+                "TELEGRAM_BOT_TOKEN": "token",
+                "PUBLIC_BASE_URL": "https://glassyreply-bot.fly.dev",
+                "DATA_DIR": tempfile.mkdtemp(),
+            }
+        )
+        try:
+            response_url = google_oauth_authorization_response(cfg, "code=abc&state=xyz")
+            self.assertTrue(response_url.startswith("https://glassyreply-bot.fly.dev/"))
+            self.assertIn("code=abc", response_url)
+            self.assertIn("state=xyz", response_url)
+        finally:
+            import shutil
+
+            shutil.rmtree(cfg.data_dir, ignore_errors=True)
 
     def test_startup_notice_text_reports_missing_setup(self) -> None:
         cfg = Config.from_env(

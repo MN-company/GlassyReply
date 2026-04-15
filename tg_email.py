@@ -1136,6 +1136,12 @@ def google_oauth_redirect_url(config: Config) -> str:
     return config.resolved_public_base_url() + "/oauth/google/callback"
 
 
+def google_oauth_authorization_response(config: Config, query_string: str) -> str:
+    if query_string:
+        return google_oauth_redirect_url(config) + "?" + query_string
+    return google_oauth_redirect_url(config)
+
+
 def google_client_config(config: Config) -> dict:
     if config.google_oauth_credentials_json:
         return json.loads(config.google_oauth_credentials_json)
@@ -2721,7 +2727,12 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
                 state=expected_state,
                 redirect_uri=google_oauth_redirect_url(runtime.config),
             )
-            flow.fetch_token(authorization_response=request.url)
+            flow.fetch_token(
+                authorization_response=google_oauth_authorization_response(
+                    runtime.config,
+                    request.query_string.decode(),
+                )
+            )
             save_runtime_settings(runtime, {"GOOGLE_OAUTH_TOKEN_JSON": flow.credentials.to_json()})
             clear_google_oauth_state(runtime)
             if owner_configured(runtime.config):

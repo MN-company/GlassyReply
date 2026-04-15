@@ -132,6 +132,8 @@ or on Fly:
 
 After you upload the JSON and tap `Connect Gmail`, Google redirects back to the bot callback URL and the refresh token is stored automatically.
 
+If you see `(insecure_transport) OAuth 2 MUST utilize https`, the bot is still building the callback with a non-HTTPS public base URL. On Fly, `PUBLIC_BASE_URL` must be the exact `https://...fly.dev` address of the app.
+
 What happens:
 
 1. The bot generates a Google authorization URL.
