@@ -5,6 +5,7 @@ import base64
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -40,6 +41,7 @@ from tg_email import (
     google_oauth_authorization_response,
     parse_google_oauth_state_payload,
     payload_text,
+    pixel_asset_response,
     save_runtime_settings,
     setup_keyboard,
     setup_message_text,
@@ -47,6 +49,7 @@ from tg_email import (
     start_google_oauth,
     startup_notice_text,
     reply_body_for_action,
+    format_tracked_email_text,
     tracked_email_status_summary,
     tracked_stats_text,
     verify_dashboard_token,
@@ -125,6 +128,15 @@ class ConfigTests(unittest.TestCase):
             {"GMAIL_MONITOR_LABELS": json.dumps(["INBOX", "CATEGORY_PROMOTIONS"])}
         )
         self.assertEqual(overridden.gmail_monitor_labels, ["INBOX", "CATEGORY_PROMOTIONS"])
+
+    def test_invalid_timezone_raises(self) -> None:
+        with self.assertRaises(ConfigError):
+            Config.from_env(
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "TIMEZONE": "Mars/Olympus",
+                }
+            )
 
 
 class AssistantUxTests(unittest.TestCase):
@@ -283,6 +295,14 @@ class StateStoreTests(unittest.TestCase):
     def test_tracked_email_pixel_event_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = StateStore(Path(tmpdir) / "state.db")
+            cfg = Config.from_env(
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "LANG": "it",
+                    "TIMEZONE": "Europe/Rome",
+                    "DATA_DIR": tmpdir,
+                }
+            )
             tracked = TrackedEmail(
                 tg_message_id=301,
                 draft_id="draft-1",
@@ -310,10 +330,111 @@ class StateStoreTests(unittest.TestCase):
             self.assertIsNotNone(updated)
             assert updated is not None
             self.assertEqual(updated.open_count, 1)
+            self.assertEqual(updated.proxy_count, 0)
             self.assertEqual(updated.last_layer, "font")
             self.assertAlmostEqual(updated.last_confidence or 0, 0.91, places=2)
-            self.assertIn("sicurezza alta", tracked_email_status_summary(updated))
-            self.assertIn("Hello", tracked_stats_text([updated]))
+            self.assertIn("apertura utente probabile 1 volta", tracked_email_status_summary(updated))
+            self.assertIn("confidenza alta", tracked_email_status_summary(updated))
+            self.assertIn("Hello", tracked_stats_text([updated], cfg))
+            with patch("tg_email.utcnow", return_value=datetime(2026, 4, 15, 16, 0, tzinfo=timezone.utc)):
+                rendered = format_tracked_email_text(updated, cfg)
+            self.assertIn("Ultima apertura utente:", rendered)
+            self.assertIn("15 apr 2026", rendered)
+            store.close()
+
+    def test_proxy_fetch_does_not_count_as_user_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = StateStore(Path(tmpdir) / "state.db")
+            tracked = TrackedEmail(
+                tg_message_id=302,
+                draft_id="draft-2",
+                recipient="lead@example.com",
+                subject="Proxy only",
+                open_count=0,
+                first_opened_at="",
+                last_opened_at="",
+                last_classification="",
+                last_layer="",
+                last_dimensions="",
+                last_confidence=None,
+            )
+            store.upsert_tracked_email(tracked)
+            updated = store.record_pixel_event(
+                tg_message_id=302,
+                classification="gmail_proxy",
+                layer="img",
+                dimensions="2x1",
+                confidence=0.98,
+                is_user_open=False,
+                email_subject="Proxy only",
+            )
+
+            self.assertIsNotNone(updated)
+            assert updated is not None
+            self.assertEqual(updated.open_count, 0)
+            self.assertEqual(updated.proxy_count, 1)
+            self.assertEqual(updated.last_opened_at, "")
+            self.assertIn("nessuna apertura utente confermata", tracked_email_status_summary(updated))
+            self.assertIn("fetch proxy 1 volta", tracked_email_status_summary(updated))
+            store.close()
+
+    def test_multiple_pixel_events_same_session_are_deduped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = StateStore(Path(tmpdir) / "state.db")
+            tracked = TrackedEmail(
+                tg_message_id=303,
+                draft_id="draft-3",
+                recipient="lead@example.com",
+                subject="Deduped",
+                open_count=0,
+                first_opened_at="",
+                last_opened_at="",
+                last_classification="",
+                last_layer="",
+                last_dimensions="",
+                last_confidence=None,
+            )
+            store.upsert_tracked_email(tracked)
+            with patch(
+                "tg_email.utcnow_iso",
+                side_effect=[
+                    "2026-04-15T15:00:00+00:00",
+                    "2026-04-15T15:00:10+00:00",
+                    "2026-04-15T15:02:05+00:00",
+                ],
+            ):
+                store.record_pixel_event(
+                    tg_message_id=303,
+                    classification="human_browser",
+                    layer="img",
+                    dimensions="2x1",
+                    confidence=0.82,
+                    is_user_open=True,
+                    email_subject="Deduped",
+                )
+                store.record_pixel_event(
+                    tg_message_id=303,
+                    classification="font_loader",
+                    layer="font",
+                    dimensions="font",
+                    confidence=0.76,
+                    is_user_open=True,
+                    email_subject="Deduped",
+                )
+                updated = store.record_pixel_event(
+                    tg_message_id=303,
+                    classification="human_browser",
+                    layer="bg",
+                    dimensions="2x1",
+                    confidence=0.82,
+                    is_user_open=True,
+                    email_subject="Deduped",
+                )
+
+            self.assertIsNotNone(updated)
+            assert updated is not None
+            self.assertEqual(updated.open_count, 2)
+            self.assertIn("riapertura probabile 1 volta", tracked_email_status_summary(updated))
             store.close()
 
 
@@ -640,6 +761,13 @@ class EmailRenderingTests(unittest.TestCase):
         self.assertIn("check the update below", rendered)
         self.assertIn("[immagine: promo banner]", rendered)
         self.assertNotIn("alert", rendered)
+
+    def test_pixel_asset_response_sets_aggressive_no_cache_headers(self) -> None:
+        response = pixel_asset_response("image")
+        self.assertIn("no-store", response.headers["cache-control"])
+        self.assertIn("proxy-revalidate", response.headers["cache-control"])
+        self.assertEqual(response.headers["pragma"], "no-cache")
+        self.assertEqual(response.headers["surrogate-control"], "no-store")
 
 
 class WebAppSmokeTests(unittest.TestCase):

@@ -23,6 +23,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -75,6 +76,19 @@ TRACKED_DRAFT_SUBJECT_KEY = "tracked_draft_subject"
 MENU_TRACKED_EMAIL = "Email Tracciata"
 MENU_STATS = "Stats"
 MENU_SETTINGS = "Impostazioni"
+TRACKING_SESSION_WINDOW_SECONDS = 90
+DEFAULT_TIMEZONE_BY_LANG = {
+    "it": "Europe/Rome",
+    "en": "UTC",
+    "fr": "Europe/Paris",
+    "de": "Europe/Berlin",
+    "es": "Europe/Madrid",
+    "pt": "Europe/Lisbon",
+}
+MONTH_LABELS = {
+    "it": ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"],
+    "en": ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+}
 GMAIL_MONITOR_LABEL_CHOICES = [
     ("INBOX", "Inbox"),
     ("CATEGORY_PERSONAL", "Primaria"),
@@ -141,6 +155,126 @@ def normalized_lang(lang: str) -> str:
     return (lang or "it").strip().lower().split("-", 1)[0].split("_", 1)[0]
 
 
+def default_timezone_for_lang(lang: str) -> str:
+    raw = (lang or "it").strip().lower().replace("-", "_")
+    if raw.startswith("en_us"):
+        return "America/New_York"
+    if raw.startswith("en_gb"):
+        return "Europe/London"
+    if raw.startswith("pt_br"):
+        return "America/Sao_Paulo"
+    if raw.startswith("es_mx"):
+        return "America/Mexico_City"
+    return DEFAULT_TIMEZONE_BY_LANG.get(normalized_lang(raw), "UTC")
+
+
+def resolve_timezone_name(timezone_name: str | None, lang: str) -> str:
+    candidate = (timezone_name or "").strip()
+    if candidate:
+        return candidate
+    return default_timezone_for_lang(lang)
+
+
+def validate_timezone_name(timezone_name: str | None, lang: str) -> None:
+    candidate = resolve_timezone_name(timezone_name, lang)
+    try:
+        ZoneInfo(candidate)
+    except ZoneInfoNotFoundError as exc:
+        raise ConfigError(f"TIMEZONE non valida: {candidate}") from exc
+
+
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def format_count_it(value: int, singular: str, plural: str) -> str:
+    return f"{value} {singular if value == 1 else plural}"
+
+
+def human_confidence_label(confidence: float | None) -> str:
+    if confidence is None:
+        return "media"
+    if confidence >= 0.9:
+        return "alta"
+    if confidence >= 0.7:
+        return "media"
+    return "bassa"
+
+
+def pixel_classification_label(classification: str) -> str:
+    mapping = {
+        "gmail_proxy": "gmail proxy",
+        "prefetch_proxy": "prefetch proxy",
+        "unknown_proxy": "proxy sconosciuto",
+        "human_browser": "browser diretto",
+        "font_loader": "font loader",
+    }
+    return mapping.get(classification, classification.replace("_", " "))
+
+
+def pixel_event_group(classification: str, is_user_open: bool | None) -> str:
+    if is_user_open or classification in {"human_browser", "font_loader"}:
+        return "user"
+    if classification in {"gmail_proxy", "prefetch_proxy", "unknown_proxy"}:
+        return "proxy"
+    return "other"
+
+
+def format_user_datetime(value: str | None, *, lang: str, timezone_name: str) -> str:
+    parsed = parse_iso_datetime(value)
+    if parsed is None:
+        return ""
+    try:
+        zone = ZoneInfo(resolve_timezone_name(timezone_name, lang))
+    except ZoneInfoNotFoundError:
+        zone = timezone.utc
+    local_dt = parsed.astimezone(zone)
+    month_labels = MONTH_LABELS.get(normalized_lang(lang), MONTH_LABELS["en"])
+    month = month_labels[local_dt.month - 1]
+    tz_label = local_dt.tzname() or resolve_timezone_name(timezone_name, lang)
+    if normalized_lang(lang) == "it":
+        base = f"{local_dt.day} {month} {local_dt.year}, {local_dt:%H:%M} {tz_label}"
+    else:
+        hour = local_dt.strftime("%I").lstrip("0") or "0"
+        base = f"{month} {local_dt.day}, {local_dt.year}, {hour}:{local_dt:%M} {local_dt:%p} {tz_label}"
+
+    now_local = utcnow().astimezone(zone)
+    delta = now_local - local_dt
+    seconds = int(delta.total_seconds())
+    if abs(seconds) < 60:
+        relative = "adesso" if normalized_lang(lang) == "it" else "just now"
+    elif abs(seconds) < 3600:
+        minutes = max(1, abs(seconds) // 60)
+        relative = (
+            f"{minutes} min fa"
+            if normalized_lang(lang) == "it"
+            else f"{minutes} min ago"
+        )
+    elif abs(seconds) < 86400:
+        hours = max(1, abs(seconds) // 3600)
+        relative = (
+            f"{hours} h fa"
+            if normalized_lang(lang) == "it"
+            else f"{hours} h ago"
+        )
+    else:
+        days = max(1, abs(seconds) // 86400)
+        relative = (
+            f"{days} g fa"
+            if normalized_lang(lang) == "it"
+            else f"{days} d ago"
+        )
+    return f"{base} ({relative})"
+
+
 def localized_manual_reply_placeholder(lang: str) -> str:
     if normalized_lang(lang) == "it":
         return "Scrivi qui la risposta e completala in Gmail."
@@ -167,6 +301,7 @@ class Config:
     port: int
     watch_interval: int
     lang: str
+    timezone_name: str
     ai_model: str
     system_prompt: str
     gmail_monitor_labels: List[str]
@@ -213,6 +348,7 @@ class Config:
         port_raw = source.get("PORT", "8080").strip()
         watch_interval_raw = source.get("WATCH_INTERVAL", "15").strip()
         lang = source.get("LANG", "it").strip() or "it"
+        timezone_name = source.get("TIMEZONE", "").strip()
         ai_model = source.get("AI_MODEL", AI_MODEL).strip() or AI_MODEL
         system_prompt = source.get("SYSTEM_PROMPT", DEFAULT_PROMPT).strip() or DEFAULT_PROMPT
         gmail_monitor_labels = parse_list(source.get("GMAIL_MONITOR_LABELS"), ["INBOX"])
@@ -237,6 +373,7 @@ class Config:
             state_retention_days = int(state_retention_days_raw)
         except ValueError as exc:
             raise ConfigError("STATE_RETENTION_DAYS must be integer") from exc
+        validate_timezone_name(timezone_name, lang)
 
         return cls(
             bot_token=bot_token,
@@ -257,6 +394,7 @@ class Config:
             port=port,
             watch_interval=watch_interval,
             lang=lang,
+            timezone_name=timezone_name,
             ai_model=ai_model,
             system_prompt=system_prompt,
             gmail_monitor_labels=gmail_monitor_labels or ["INBOX"],
@@ -308,6 +446,7 @@ class Config:
             raise ConfigError("GMAIL_MONITOR_LABELS must contain at least one label")
         if self.enable_pixel and not self.pixel_webhook_secret:
             raise ConfigError("ENABLE_PIXEL=true requires PIXEL_WEBHOOK_SECRET")
+        validate_timezone_name(self.timezone_name, self.lang)
         if mode == "webhook":
             if not self.telegram_webhook_secret:
                 raise ConfigError("Webhook mode requires TELEGRAM_WEBHOOK_SECRET")
@@ -325,6 +464,9 @@ class Config:
     def resolved_pixel_base_url(self) -> str:
         return (self.pixel_base_url or self.public_base_url).rstrip("/")
 
+    def resolved_timezone_name(self) -> str:
+        return resolve_timezone_name(self.timezone_name, self.lang)
+
     def with_overrides(self, overrides: Mapping[str, str]) -> "Config":
         if not overrides:
             return self
@@ -340,6 +482,7 @@ class Config:
             "port": self.port,
             "watch_interval": self.watch_interval,
             "lang": self.lang,
+            "timezone_name": self.timezone_name,
             "ai_model": self.ai_model,
             "system_prompt": self.system_prompt,
             "gmail_monitor_labels": list(self.gmail_monitor_labels),
@@ -378,6 +521,8 @@ class Config:
             data["watch_interval"] = parse_int(overrides["WATCH_INTERVAL"], data["watch_interval"])
         if "LANG" in overrides:
             data["lang"] = overrides["LANG"].strip() or data["lang"]
+        if "TIMEZONE" in overrides:
+            data["timezone_name"] = overrides["TIMEZONE"].strip()
         if "AI_MODEL" in overrides:
             data["ai_model"] = overrides["AI_MODEL"].strip() or data["ai_model"]
         if "SYSTEM_PROMPT" in overrides:
@@ -448,6 +593,15 @@ class TrackedEmail:
     last_layer: str
     last_dimensions: str
     last_confidence: float | None
+    proxy_count: int = 0
+    raw_event_count: int = 0
+    last_proxy_at: str = ""
+    last_proxy_classification: str = ""
+    last_proxy_layer: str = ""
+    last_proxy_confidence: float | None = None
+    last_user_classification: str = ""
+    last_user_layer: str = ""
+    last_user_confidence: float | None = None
     created_at: str = ""
     updated_at: str = ""
 
@@ -706,7 +860,7 @@ class StateStore:
                 "SELECT * FROM tracked_emails WHERE tg_message_id = ?",
                 (tg_message_id,),
             ).fetchone()
-        return TrackedEmail.from_row(row) if row else None
+        return self._tracked_email_from_row(row) if row else None
 
     def list_tracked_emails(self, limit: int = 10) -> List[TrackedEmail]:
         with self._lock:
@@ -714,7 +868,111 @@ class StateStore:
                 "SELECT * FROM tracked_emails ORDER BY updated_at DESC, tg_message_id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [TrackedEmail.from_row(row) for row in rows]
+        return [self._tracked_email_from_row(row) for row in rows]
+
+    def _tracked_email_from_row(self, row: sqlite3.Row) -> TrackedEmail:
+        tracked = TrackedEmail.from_row(row)
+        metrics = self._tracked_event_metrics(tracked.tg_message_id)
+        return replace(
+            tracked,
+            open_count=metrics["open_count"],
+            first_opened_at=metrics["first_opened_at"],
+            last_opened_at=metrics["last_opened_at"],
+            last_classification=metrics["last_classification"],
+            last_layer=metrics["last_layer"],
+            last_dimensions=metrics["last_dimensions"],
+            last_confidence=metrics["last_confidence"],
+            proxy_count=metrics["proxy_count"],
+            raw_event_count=metrics["raw_event_count"],
+            last_proxy_at=metrics["last_proxy_at"],
+            last_proxy_classification=metrics["last_proxy_classification"],
+            last_proxy_layer=metrics["last_proxy_layer"],
+            last_proxy_confidence=metrics["last_proxy_confidence"],
+            last_user_classification=metrics["last_user_classification"],
+            last_user_layer=metrics["last_user_layer"],
+            last_user_confidence=metrics["last_user_confidence"],
+        )
+
+    def _tracked_event_metrics(self, tg_message_id: int) -> Dict[str, Any]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, classification, layer, dimensions, confidence, is_user_open, created_at
+                FROM pixel_events
+                WHERE tg_message_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (tg_message_id,),
+            ).fetchall()
+        return self._tracked_event_metrics_from_rows(rows)
+
+    def _tracked_event_metrics_from_rows(self, rows: List[sqlite3.Row]) -> Dict[str, Any]:
+        metrics: Dict[str, Any] = {
+            "open_count": 0,
+            "proxy_count": 0,
+            "raw_event_count": len(rows),
+            "first_opened_at": "",
+            "last_opened_at": "",
+            "last_proxy_at": "",
+            "last_classification": "",
+            "last_layer": "",
+            "last_dimensions": "",
+            "last_confidence": None,
+            "last_proxy_classification": "",
+            "last_proxy_layer": "",
+            "last_proxy_confidence": None,
+            "last_user_classification": "",
+            "last_user_layer": "",
+            "last_user_confidence": None,
+        }
+        last_user_session_at: datetime | None = None
+        last_proxy_session_at: datetime | None = None
+
+        for row in rows:
+            classification = str(row["classification"] or "")
+            layer = str(row["layer"] or "")
+            dimensions = str(row["dimensions"] or "")
+            confidence = row["confidence"]
+            confidence_value = float(confidence) if confidence is not None else None
+            is_user_open_raw = row["is_user_open"]
+            if is_user_open_raw is None:
+                is_user_open = None
+            else:
+                is_user_open = bool(is_user_open_raw)
+            created_at = str(row["created_at"] or "")
+            parsed = parse_iso_datetime(created_at)
+
+            metrics["last_classification"] = classification
+            metrics["last_layer"] = layer
+            metrics["last_dimensions"] = dimensions
+            metrics["last_confidence"] = confidence_value
+
+            group = pixel_event_group(classification, is_user_open)
+            if group == "user":
+                metrics["last_opened_at"] = created_at
+                metrics["last_user_classification"] = classification
+                metrics["last_user_layer"] = layer
+                metrics["last_user_confidence"] = confidence_value
+                if metrics["first_opened_at"] == "":
+                    metrics["first_opened_at"] = created_at
+                if parsed is None or last_user_session_at is None:
+                    metrics["open_count"] += 1
+                    last_user_session_at = parsed
+                elif (parsed - last_user_session_at).total_seconds() > TRACKING_SESSION_WINDOW_SECONDS:
+                    metrics["open_count"] += 1
+                    last_user_session_at = parsed
+            elif group == "proxy":
+                metrics["last_proxy_at"] = created_at
+                metrics["last_proxy_classification"] = classification
+                metrics["last_proxy_layer"] = layer
+                metrics["last_proxy_confidence"] = confidence_value
+                if parsed is None or last_proxy_session_at is None:
+                    metrics["proxy_count"] += 1
+                    last_proxy_session_at = parsed
+                elif (parsed - last_proxy_session_at).total_seconds() > TRACKING_SESSION_WINDOW_SECONDS:
+                    metrics["proxy_count"] += 1
+                    last_proxy_session_at = parsed
+        return metrics
 
     def record_pixel_event(
         self,
@@ -727,11 +985,14 @@ class StateStore:
         is_user_open: bool | None,
         email_subject: str,
     ) -> TrackedEmail | None:
-        tracked = self.get_tracked_email(tg_message_id)
-        if tracked is None:
-            return None
         event_time = utcnow_iso()
         with self._lock, self._conn:
+            tracked_row = self._conn.execute(
+                "SELECT * FROM tracked_emails WHERE tg_message_id = ?",
+                (tg_message_id,),
+            ).fetchone()
+            if tracked_row is None:
+                return None
             self._conn.execute(
                 """
                 INSERT INTO pixel_events (
@@ -750,8 +1011,16 @@ class StateStore:
                     event_time,
                 ),
             )
-            first_opened_at = tracked.first_opened_at or event_time
-            open_count = tracked.open_count + 1
+            rows = self._conn.execute(
+                """
+                SELECT id, classification, layer, dimensions, confidence, is_user_open, created_at
+                FROM pixel_events
+                WHERE tg_message_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (tg_message_id,),
+            ).fetchall()
+            metrics = self._tracked_event_metrics_from_rows(rows)
             self._conn.execute(
                 """
                 UPDATE tracked_emails
@@ -761,13 +1030,13 @@ class StateStore:
                 WHERE tg_message_id = ?
                 """,
                 (
-                    open_count,
-                    first_opened_at,
-                    event_time,
-                    classification,
-                    layer,
-                    dimensions,
-                    confidence,
+                    metrics["open_count"],
+                    metrics["first_opened_at"],
+                    metrics["last_opened_at"],
+                    metrics["last_classification"],
+                    metrics["last_layer"],
+                    metrics["last_dimensions"],
+                    metrics["last_confidence"],
                     event_time,
                     tg_message_id,
                 ),
@@ -1459,6 +1728,7 @@ def settings_message_text(runtime: Runtime) -> str:
     public_base_url = ihtml.escape(runtime.config.resolved_public_base_url() or "missing")
     monitor_labels = ihtml.escape(", ".join(runtime.config.gmail_monitor_labels))
     pixel_base_url = ihtml.escape(runtime.config.resolved_pixel_base_url() or "missing")
+    timezone_label = ihtml.escape(runtime.config.resolved_timezone_name())
     lines = [
         "Impostazioni rapide:",
         "",
@@ -1466,6 +1736,7 @@ def settings_message_text(runtime: Runtime) -> str:
         f"- Gmail OAuth: {'set' if google_credentials_available(runtime.config) else 'missing'}",
         f"- Gmail token: {'set' if google_token_available(runtime.config) else 'missing'}",
         f"- Cartelle Gmail: {monitor_labels}",
+        f"- Timezone: {timezone_label}",
         f"- Pixel: {'enabled' if runtime.config.enable_pixel else 'disabled'}",
         f"- Pixel URL: {pixel_base_url}",
         f"- Public URL: {public_base_url}",
@@ -1477,32 +1748,49 @@ def settings_message_text(runtime: Runtime) -> str:
 
 
 def tracked_email_status_summary(tracked: TrackedEmail) -> str:
-    if tracked.open_count <= 0:
-        return "Mai aperta"
-    reopen_count = max(0, tracked.open_count - 1)
-    security = "bassa"
-    if tracked.last_classification == "human_browser":
-        if tracked.last_confidence is not None and tracked.last_confidence >= 0.85:
-            security = "alta"
-        else:
-            security = "media"
-    elif tracked.last_confidence is not None and tracked.last_confidence >= 0.75:
-        security = "media"
-    pieces = [f"Aperta {tracked.open_count} volta{'e' if tracked.open_count != 1 else ''}"]
-    if reopen_count:
-        pieces.append(f"riaperta {reopen_count} volta{'e' if reopen_count != 1 else ''}")
-    if tracked.last_classification:
-        pieces.append(tracked.last_classification.replace("_", " "))
-    if tracked.last_layer:
-        pieces.append(f"via {tracked.last_layer}")
-    if tracked.last_confidence is not None:
-        pieces.append(f"sicurezza {security} ({tracked.last_confidence:.2f})")
+    pieces: List[str] = []
+    if tracked.open_count > 0:
+        pieces.append(f"apertura utente probabile {format_count_it(tracked.open_count, 'volta', 'volte')}")
+        reopen_count = max(0, tracked.open_count - 1)
+        if reopen_count:
+            pieces.append(f"riapertura probabile {format_count_it(reopen_count, 'volta', 'volte')}")
+    elif tracked.proxy_count > 0:
+        pieces.append("nessuna apertura utente confermata")
     else:
-        pieces.append(f"sicurezza {security}")
+        return "Nessun evento rilevato"
+
+    if tracked.proxy_count > 0:
+        pieces.append(f"fetch proxy {format_count_it(tracked.proxy_count, 'volta', 'volte')}")
+
+    relevant_classification = (
+        tracked.last_user_classification
+        if tracked.open_count > 0
+        else tracked.last_proxy_classification or tracked.last_classification
+    )
+    relevant_layer = (
+        tracked.last_user_layer
+        if tracked.open_count > 0
+        else tracked.last_proxy_layer or tracked.last_layer
+    )
+    relevant_confidence = (
+        tracked.last_user_confidence
+        if tracked.open_count > 0
+        else tracked.last_proxy_confidence if tracked.proxy_count > 0 else tracked.last_confidence
+    )
+    if relevant_classification:
+        pieces.append(pixel_classification_label(relevant_classification))
+    if relevant_layer:
+        pieces.append(f"via {relevant_layer}")
+    if relevant_confidence is not None:
+        pieces.append(f"confidenza {human_confidence_label(relevant_confidence)} ({relevant_confidence:.2f})")
     return " · ".join(pieces)
 
 
-def format_tracked_email_text(tracked: TrackedEmail, note: str | None = None) -> str:
+def format_tracked_email_text(
+    tracked: TrackedEmail,
+    config: Config,
+    note: str | None = None,
+) -> str:
     lines = [
         f"🛰️ <b>{ihtml.escape(tracked.subject or '(senza oggetto)')}</b>",
         f"To: <code>{ihtml.escape(tracked.recipient)}</code>",
@@ -1510,13 +1798,23 @@ def format_tracked_email_text(tracked: TrackedEmail, note: str | None = None) ->
         ihtml.escape(tracked_email_status_summary(tracked)),
     ]
     if tracked.last_opened_at:
-        lines.append(ihtml.escape(f"Ultima apertura: {tracked.last_opened_at}"))
+        lines.append(
+            ihtml.escape(
+                f"Ultima apertura utente: {format_user_datetime(tracked.last_opened_at, lang=config.lang, timezone_name=config.resolved_timezone_name())}"
+            )
+        )
+    if tracked.last_proxy_at:
+        lines.append(
+            ihtml.escape(
+                f"Ultimo fetch proxy: {format_user_datetime(tracked.last_proxy_at, lang=config.lang, timezone_name=config.resolved_timezone_name())}"
+            )
+        )
     if note:
         lines.extend(["", "---", ihtml.escape(note)])
     return "\n".join(lines)
 
 
-def tracked_stats_text(tracked_items: List[TrackedEmail]) -> str:
+def tracked_stats_text(tracked_items: List[TrackedEmail], config: Config) -> str:
     if not tracked_items:
         return "📊 Nessuna email tracciata ancora."
     lines = ["📊 <b>Email tracciate</b>", ""]
@@ -1525,7 +1823,17 @@ def tracked_stats_text(tracked_items: List[TrackedEmail]) -> str:
         lines.append(f"To: <code>{ihtml.escape(tracked.recipient)}</code>")
         lines.append(ihtml.escape(tracked_email_status_summary(tracked)))
         if tracked.last_opened_at:
-            lines.append(ihtml.escape(f"Ultima apertura: {tracked.last_opened_at}"))
+            lines.append(
+                ihtml.escape(
+                    f"Ultima apertura utente: {format_user_datetime(tracked.last_opened_at, lang=config.lang, timezone_name=config.resolved_timezone_name())}"
+                )
+            )
+        elif tracked.last_proxy_at:
+            lines.append(
+                ihtml.escape(
+                    f"Ultimo fetch proxy: {format_user_datetime(tracked.last_proxy_at, lang=config.lang, timezone_name=config.resolved_timezone_name())}"
+                )
+            )
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -1699,7 +2007,8 @@ def classify_pixel_request(
         confidence = 0.9
     elif layer == "font" or sec_fetch_dest == "font" or "font" in accept:
         classification = "font_loader"
-        confidence = 0.85
+        confidence = 0.76 if has_browser_fetch_headers or ua else 0.68
+        is_user_open = True
     elif has_browser_fetch_headers or any(browser in ua for browser in ("chrome", "firefox", "safari", "edg/")):
         classification = "human_browser"
         confidence = 0.82
@@ -1723,22 +2032,27 @@ def classify_pixel_request(
 
 
 def pixel_asset_response(kind: str) -> Response:
+    headers = {
+        "cache-control": "private, no-cache, no-store, max-age=0, s-maxage=0, must-revalidate, proxy-revalidate",
+        "pragma": "no-cache",
+        "expires": "0",
+        "surrogate-control": "no-store",
+        "cdn-cache-control": "no-store",
+        "cloudflare-cdn-cache-control": "no-store",
+        "vary": "User-Agent, Accept, Accept-Language, Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site, Purpose, Sec-Purpose, X-Gmail-Fetch-Info",
+        "x-content-type-options": "nosniff",
+        "access-control-allow-origin": "*",
+        "timing-allow-origin": "*",
+        "accept-ranges": "none",
+    }
     if kind == "font":
         return Response(
             PIXEL_PROBE_FONT,
-            headers={
-                "content-type": "font/woff2",
-                "cache-control": "no-store, max-age=0",
-                "vary": "user-agent",
-            },
+            headers={**headers, "content-type": "font/woff2"},
         )
     return Response(
         TRANSPARENT_PNG_2X1,
-        headers={
-            "content-type": "image/png",
-            "cache-control": "no-store, max-age=0",
-            "vary": "user-agent",
-        },
+        headers={**headers, "content-type": "image/png"},
     )
 
 
@@ -1762,12 +2076,22 @@ async def apply_pixel_event(runtime: Runtime, application: Application, event: M
         is_user_open_value = parse_bool(str(is_user_open), default=False)
 
     original = runtime.store.get_email_state(tg_message_id)
+    tracked_before = runtime.store.get_tracked_email(tg_message_id)
     email_subject = event.get("email_subject") or ""
+    classification = str(event.get("classification") or "")
+    layer = str(event.get("layer") or "img")
+    dimensions = str(event.get("dimensions") or "")
+    event_group = pixel_event_group(classification, is_user_open_value)
+    event_time_text = format_user_datetime(
+        str(event.get("received_at") or utcnow_iso()),
+        lang=runtime.config.lang,
+        timezone_name=runtime.config.resolved_timezone_name(),
+    )
     tracked = runtime.store.record_pixel_event(
         tg_message_id=tg_message_id,
-        classification=str(event.get("classification") or ""),
-        layer=str(event.get("layer") or "img"),
-        dimensions=str(event.get("dimensions") or ""),
+        classification=classification,
+        layer=layer,
+        dimensions=dimensions,
         confidence=confidence_value,
         is_user_open=is_user_open_value,
         email_subject=email_subject,
@@ -1779,25 +2103,44 @@ async def apply_pixel_event(runtime: Runtime, application: Application, event: M
             email_subject = tracked.subject
 
     if original:
-        classification = str(event.get("classification") or "")
-        layer = str(event.get("layer") or "img")
-        dimensions = str(event.get("dimensions") or "")
-        if classification:
-            icon = "✅" if classification == "human_browser" else "⚠️"
-            confidence_text = f", conf {confidence_value}" if confidence_value is not None else ""
-            status_text = f"{icon} {classification.replace('_', ' ')} via {layer}"
-            if dimensions:
-                status_text += f" ({dimensions}{confidence_text})"
+        if event_group == "user":
+            status_text = f"✅ apertura utente probabile · {pixel_classification_label(classification)}"
+        elif event_group == "proxy":
+            status_text = f"⚠️ fetch proxy rilevato · {pixel_classification_label(classification)}"
         else:
-            status_icon = "✅" if is_user_open_value else "❌"
-            status_text = f"{status_icon} opened by user" if is_user_open_value else "❌ opened by proxy"
+            status_text = f"ℹ️ evento pixel · {pixel_classification_label(classification) if classification else 'sconosciuto'}"
+        if layer:
+            status_text += f" via {layer}"
+        if dimensions:
+            status_text += f" ({dimensions})"
+        if confidence_value is not None:
+            status_text += f" · confidenza {human_confidence_label(confidence_value)} ({confidence_value:.2f})"
+        if event_time_text:
+            status_text += f" · {event_time_text}"
+        if event_group == "proxy":
+            status_text += " · non conta come apertura utente"
         text = format_email_text(
             original,
             status_line=f"{status_text} {f'[{email_subject}]' if email_subject else ''}".strip(),
         )
     elif tracked:
-        note = email_subject or "Evento pixel ricevuto."
-        text = format_tracked_email_text(tracked, note=note)
+        if event_group == "user":
+            if tracked_before is not None and tracked.open_count > tracked_before.open_count:
+                note = (
+                    "Nuova riapertura probabile rilevata."
+                    if tracked.open_count > 1
+                    else "Nuova apertura utente probabile rilevata."
+                )
+            else:
+                note = "Segnale utente aggiuntivo rilevato nella stessa sessione."
+        elif event_group == "proxy":
+            if tracked_before is not None and tracked.proxy_count > tracked_before.proxy_count:
+                note = "Fetch proxy rilevato. Non conta come apertura utente."
+            else:
+                note = "Segnale proxy aggiuntivo rilevato nella stessa sessione."
+        else:
+            note = email_subject or "Evento pixel ricevuto."
+        text = format_tracked_email_text(tracked, runtime.config, note=note)
     else:
         fallback = EmailState(
             tg_message_id=tg_message_id,
@@ -1944,6 +2287,7 @@ def setup_status_lines(runtime: Runtime) -> List[str]:
         f"Google OAuth client JSON: {'set' if google_credentials_available(config) else 'missing'}",
         f"Gmail refresh token: {'set' if google_token_available(config) else 'missing'}",
         f"Gmail monitor labels: {', '.join(config.gmail_monitor_labels)}",
+        f"Timezone: {config.resolved_timezone_name()}",
         f"Pixel tracking: {'enabled' if config.enable_pixel else 'disabled'}",
     ]
 
@@ -1969,18 +2313,18 @@ def settings_keyboard(runtime: Runtime) -> InlineKeyboardMarkup:
             InlineKeyboardButton("Public URL", callback_data="settings|public_base_url"),
         ],
         [
+            InlineKeyboardButton("Fuso orario", callback_data="settings|timezone"),
             InlineKeyboardButton("Cartelle Gmail", callback_data="settings|monitor_labels"),
+        ],
+        [
             InlineKeyboardButton("OAuth JSON", callback_data="settings|oauth_json"),
-        ],
-        [
             InlineKeyboardButton("Pixel URL", callback_data="settings|pixel_base_url"),
-            InlineKeyboardButton("Pixel secret", callback_data="settings|pixel_webhook_secret"),
         ],
         [
-            InlineKeyboardButton(
-                "Pixel ON/OFF",
-                callback_data="settings|toggle_pixel",
-            ),
+            InlineKeyboardButton("Pixel secret", callback_data="settings|pixel_webhook_secret"),
+            InlineKeyboardButton("Pixel ON/OFF", callback_data="settings|toggle_pixel"),
+        ],
+        [
             InlineKeyboardButton("Open dashboard", callback_data="settings|dashboard"),
         ],
     ]
@@ -2162,6 +2506,7 @@ BOT_CONFIG_ALIASES = {
     "pixel_webhook_url": "PIXEL_WEBHOOK_URL",
     "watch_interval": "WATCH_INTERVAL",
     "lang": "LANG",
+    "timezone": "TIMEZONE",
     "ai_model": "AI_MODEL",
     "system_prompt": "SYSTEM_PROMPT",
     "gmail_monitor_labels": "GMAIL_MONITOR_LABELS",
@@ -2188,18 +2533,26 @@ def build_tracking_markup_for_message_id(config: Config, tg_message_id: int) -> 
     base_url = config.resolved_pixel_base_url()
     token = make_tracking_token(config, tg_message_id)
     nonce = uuid4().hex[:10]
-    img_url = f"{base_url}/track/img/2x1/{token}.png"
-    bg_url = f"{base_url}/track/bg/2x1/{token}.png"
-    dark_url = f"{base_url}/track/dark/2x1/{token}.png"
-    font_url = f"{base_url}/track/font/{token}.woff2"
+    img_url = f"{base_url}/track/img/2x1/{token}.png?v={nonce}a"
+    retina_img_url = f"{base_url}/track/img/4x1/{token}.png?v={nonce}b"
+    bg_url = f"{base_url}/track/bg/2x1/{token}.png?v={nonce}c"
+    dark_url = f"{base_url}/track/dark/2x1/{token}.png?v={nonce}d"
+    font_url = f"{base_url}/track/font/{token}.woff2?v={nonce}e"
     return (
         '<div style="line-height:1px;max-height:1px;overflow:hidden;">'
         f'<img src="{img_url}" width="2" height="1" alt="" '
+        f'srcset="{img_url} 1x, {retina_img_url} 2x" '
         'style="display:block;border:0;outline:none;text-decoration:none;opacity:0.01;">'
+        f'<img src="{retina_img_url}" width="1" height="1" alt="" '
+        'style="display:block;border:0;outline:none;text-decoration:none;opacity:0.01;">'
+        f'<table role="presentation" cellpadding="0" cellspacing="0" border="0" background="{bg_url}" '
+        'style="background-image:url(\''
+        f'{bg_url}'
+        '\');background-repeat:no-repeat;background-size:2px 1px;width:2px;height:1px;max-height:1px;overflow:hidden;opacity:0.01;"><tr><td style="font-size:1px;line-height:1px;">&nbsp;</td></tr></table>'
         f'<div class="gr-bg-{nonce}" style="background-image:url(\'{bg_url}\');'
         'background-repeat:no-repeat;background-size:2px 1px;width:2px;height:1px;'
         'max-height:1px;overflow:hidden;opacity:0.01;">&nbsp;</div>'
-        f'<div class="gr-dark-{nonce}" style="background-image:url(\'{bg_url}\');'
+        f'<div class="gr-dark-{nonce}" style="background-image:url(\'{dark_url}\');'
         'background-repeat:no-repeat;background-size:2px 1px;width:2px;height:1px;'
         'max-height:1px;overflow:hidden;opacity:0.01;">&nbsp;</div>'
         f'<span class="gr-font-{nonce}" style="font-family:\'grtrack-{nonce}\',Arial,sans-serif;'
@@ -2297,6 +2650,13 @@ EDITABLE_DASHBOARD_FIELDS = [
         label="Reply language",
         kind="text",
         help_text="Language used for Gemini reply drafts.",
+    ),
+    DashboardField(
+        key="TIMEZONE",
+        attr="timezone_name",
+        label="Timezone",
+        kind="text",
+        help_text="IANA timezone used for readable timestamps. Example: Europe/Rome.",
     ),
     DashboardField(
         key="AI_MODEL",
@@ -2943,7 +3303,7 @@ async def send_settings_message(message, runtime: Runtime, text: str | None = No
 async def send_tracked_stats(message, runtime: Runtime) -> None:
     tracked_items = runtime.store.list_tracked_emails(limit=10)
     await message.reply_text(
-        tracked_stats_text(tracked_items),
+        tracked_stats_text(tracked_items, runtime.config),
         reply_markup=stats_keyboard(),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
@@ -3109,7 +3469,7 @@ async def create_tracked_draft(
     runtime.store.upsert_tracked_email(tracked)
     runtime.store.purge_old_rows(runtime.config.state_retention_days)
     note = "Bozza creata. Apri Gmail > Drafts, completa il testo e inviala."
-    await safe_edit(placeholder, text=format_tracked_email_text(tracked, note=note), markup=stats_keyboard())
+    await safe_edit(placeholder, text=format_tracked_email_text(tracked, runtime.config, note=note), markup=stats_keyboard())
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3400,6 +3760,16 @@ async def handle_settings_callback(
         )
         await query.answer()
         return True
+    if action == "timezone":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text="Rispondi con la timezone IANA da usare nei report. Esempio: Europe/Rome o America/New_York.",
+            action_kind="setup_timezone",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
     if action == "pixel_base_url":
         await prompt_for_setup_value(
             context,
@@ -3502,6 +3872,12 @@ async def txt_followup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     raise ConfigError("Serve una PUBLIC_BASE_URL testuale.")
                 save_runtime_settings(runtime, {"PUBLIC_BASE_URL": raw_text})
                 await send_setup_message(message, runtime, "Public base URL salvata.")
+                return
+            if interactive.action_kind == "setup_timezone":
+                if not raw_text:
+                    raise ConfigError("Serve una timezone IANA testuale.")
+                save_runtime_settings(runtime, {"TIMEZONE": raw_text})
+                await send_settings_message(message, runtime, "Timezone salvata.")
                 return
             if interactive.action_kind == "setup_pixel_base_url":
                 save_runtime_settings(runtime, {"PIXEL_BASE_URL": raw_text})
@@ -3653,7 +4029,7 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if action == "stats":
         if query.message is not None:
-            await safe_edit(query.message, text=tracked_stats_text(runtime.store.list_tracked_emails(limit=10)), markup=stats_keyboard())
+            await safe_edit(query.message, text=tracked_stats_text(runtime.store.list_tracked_emails(limit=10), runtime.config), markup=stats_keyboard())
         await query.answer()
         return
     if action == "tracked":

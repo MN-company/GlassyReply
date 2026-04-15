@@ -91,6 +91,7 @@ Optional runtime values:
 - `ENABLE_PIXEL=true`
 - `PIXEL_WEBHOOK_SECRET=shared-secret`
 - `PIXEL_BASE_URL=https://another-host.example.com` only if you want an external tracker instead of the built-in Fly routes
+- `TIMEZONE=Europe/Rome`
 - `TELEGRAM_WEBHOOK_URL=https://your-public-host`
 - `TELEGRAM_WEBHOOK_SECRET=telegram-secret`
 
@@ -105,7 +106,7 @@ python3 tg_email.py --mode polling
 Then in Telegram:
 
 1. Send `/start` to claim the bot owner.
-2. Send `/setup` to see the setup checklist.
+2. Send `/setup` to see the next setup step only.
 3. Set `PUBLIC_BASE_URL` if the bot runs on Fly or another public host.
 4. Set the Gemini key from the bot or with `/set google_api_key ...`.
 5. Upload the Google OAuth Web client JSON from the setup flow.
@@ -263,6 +264,15 @@ Fly checks:
 ## Pixel tracker
 
 Pixel tracking is optional and intentionally classified as telemetry, not truth.
+
+Telegram stats now distinguish between:
+
+- proxy fetches
+- probable user opens
+- probable reopens
+- confidence score + layer used for the latest useful signal
+
+Readable timestamps use the configured `TIMEZONE` and fall back to a language-based default when the timezone is unset.
 
 ### Recommended setup: self-hosted on Fly
 
