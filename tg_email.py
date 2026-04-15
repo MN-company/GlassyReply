@@ -61,6 +61,7 @@ PAGE_SIZE = 30
 STATE_RETENTION_DAYS = 30
 LAST_SEEN_KEY = "last_seen_gmail_message_id"
 GOOGLE_OAUTH_STATE_KEY = "google_oauth_pending_state"
+GMAIL_INITIAL_SYNC_KEY = "gmail_initial_sync_pending"
 PREDEF_FWD = ["redazione@example.com", "boss@example.com"]
 DEFAULT_PROMPT = (
     "Sei un assistente professionale. Scrivi una risposta "
@@ -247,11 +248,13 @@ class Config:
 
     def materialize_gmail_token(self) -> None:
         self.ensure_storage()
-        if not self.google_oauth_token_json or self.gmail_token_path.exists():
+        if not self.google_oauth_token_json:
             return
         payload = json.loads(self.google_oauth_token_json)
         content = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-        self.gmail_token_path.write_text(content)
+        current = self.gmail_token_path.read_text() if self.gmail_token_path.exists() else ""
+        if current != content:
+            self.gmail_token_path.write_text(content)
 
     def validate_mode(self, mode: str) -> None:
         self.validate_effective(mode)
@@ -1266,6 +1269,19 @@ def claim_owner(runtime: Runtime, user_id: int) -> None:
 
 def clear_google_oauth_state(runtime: Runtime) -> None:
     runtime.store.set_bot_state(GOOGLE_OAUTH_STATE_KEY, "")
+
+
+def mark_gmail_initial_sync_pending(runtime: Runtime) -> None:
+    runtime.store.set_bot_state(GMAIL_INITIAL_SYNC_KEY, "1")
+    runtime.store.set_bot_state(LAST_SEEN_KEY, "")
+
+
+def gmail_initial_sync_pending(runtime: Runtime) -> bool:
+    return runtime.store.get_bot_state(GMAIL_INITIAL_SYNC_KEY) == "1"
+
+
+def clear_gmail_initial_sync_pending(runtime: Runtime) -> None:
+    runtime.store.set_bot_state(GMAIL_INITIAL_SYNC_KEY, "")
 
 
 def google_oauth_state_payload(state: str, code_verifier: str | None) -> str:
@@ -2596,6 +2612,9 @@ async def watcher(runtime: Runtime, application: Application) -> None:
         try:
             recent_ids = await asyncio.to_thread(runtime.gmail.list_recent_inbox_ids, 1)
             if recent_ids:
+                if gmail_initial_sync_pending(runtime):
+                    await process_new_email(application, runtime, recent_ids[0])
+                    clear_gmail_initial_sync_pending(runtime)
                 last_seen = recent_ids[0]
                 runtime.store.set_bot_state(LAST_SEEN_KEY, last_seen)
         except Exception:
@@ -2755,6 +2774,7 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
             )
             save_runtime_settings(runtime, {"GOOGLE_OAUTH_TOKEN_JSON": flow.credentials.to_json()})
             clear_google_oauth_state(runtime)
+            mark_gmail_initial_sync_pending(runtime)
             if owner_configured(runtime.config):
                 await application.bot.send_message(
                     chat_id=runtime.config.chat_id,

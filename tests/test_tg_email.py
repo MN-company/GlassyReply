@@ -11,6 +11,7 @@ from unittest.mock import patch
 from googleapiclient.errors import HttpError
 
 from tg_email import (
+    GMAIL_INITIAL_SYNC_KEY,
     GOOGLE_OAUTH_STATE_KEY,
     Runtime,
     Config,
@@ -22,8 +23,10 @@ from tg_email import (
     build_application,
     claim_owner,
     create_web_app,
+    gmail_initial_sync_pending,
     google_oauth_state_payload,
     google_web_client_config,
+    mark_gmail_initial_sync_pending,
     make_dashboard_token,
     owner_configured,
     is_authorized_update,
@@ -72,6 +75,29 @@ class ConfigTests(unittest.TestCase):
             }
         )
         self.assertEqual(cfg.chat_id, 0)
+
+    def test_materialize_gmail_token_overwrites_stale_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Config.from_env(
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "DATA_DIR": tmpdir,
+                    "GOOGLE_OAUTH_TOKEN_JSON": json.dumps(
+                        {
+                            "refresh_token": "fresh-refresh-token",
+                            "client_id": "client-id",
+                            "client_secret": "client-secret",
+                            "token_uri": "https://oauth2.googleapis.com/token",
+                        }
+                    ),
+                }
+            )
+            cfg.gmail_token_path.write_text('{"refresh_token":"stale-refresh-token"}\n')
+
+            cfg.materialize_gmail_token()
+
+            stored = json.loads(cfg.gmail_token_path.read_text())
+            self.assertEqual(stored["refresh_token"], "fresh-refresh-token")
 
 
 class StateStoreTests(unittest.TestCase):
@@ -281,6 +307,34 @@ class SelfHostedSetupTests(unittest.TestCase):
                 self.assertEqual(state_payload["state"], "oauth-state")
                 self.assertEqual(state_payload["code_verifier"], "pkce-verifier")
                 self.assertIn("redirect_uri", mocked.call_args.kwargs)
+            finally:
+                store.close()
+
+    def test_mark_gmail_initial_sync_pending_sets_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Config.from_env(
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "DATA_DIR": tmpdir,
+                }
+            )
+            store = StateStore(Path(tmpdir) / "state.db")
+            runtime = Runtime(
+                base_config=cfg,
+                config=cfg,
+                startup_overrides={},
+                store=store,
+                gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+                model=None,
+                shutdown_event=SimpleNamespace(),
+                mode="polling",
+            )
+            try:
+                runtime.store.set_bot_state("last_seen_gmail_message_id", "old-id")
+                mark_gmail_initial_sync_pending(runtime)
+                self.assertTrue(gmail_initial_sync_pending(runtime))
+                self.assertEqual(runtime.store.get_bot_state(GMAIL_INITIAL_SYNC_KEY), "1")
+                self.assertEqual(runtime.store.get_bot_state("last_seen_gmail_message_id"), "")
             finally:
                 store.close()
 
@@ -496,6 +550,8 @@ class WebAppSmokeTests(unittest.TestCase):
                         store.get_app_settings()["GOOGLE_OAUTH_TOKEN_JSON"],
                         json.dumps({"refresh_token": "token-value"}),
                     )
+                    self.assertEqual(store.get_bot_state(GMAIL_INITIAL_SYNC_KEY), "1")
+                    self.assertEqual(store.get_bot_state("last_seen_gmail_message_id"), "")
                 finally:
                     store.close()
 
