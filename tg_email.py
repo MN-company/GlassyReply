@@ -137,6 +137,16 @@ def parse_list(raw: str | None, default: List[str]) -> List[str]:
     return items or list(default)
 
 
+def normalized_lang(lang: str) -> str:
+    return (lang or "it").strip().lower().split("-", 1)[0].split("_", 1)[0]
+
+
+def localized_manual_reply_placeholder(lang: str) -> str:
+    if normalized_lang(lang) == "it":
+        return "Scrivi qui la risposta e completala in Gmail."
+    return "Write your reply here and finish it in Gmail."
+
+
 @dataclass(slots=True)
 class Config:
     bot_token: str
@@ -1343,11 +1353,74 @@ def build_raw(to_addr: str, subject: str, plain: str, tracking_markup: str | Non
     return base64.urlsafe_b64encode(message.as_bytes()).decode()
 
 
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [[MENU_TRACKED_EMAIL, MENU_STATS], [MENU_SETTINGS]],
-        resize_keyboard=True,
+def tracked_email_enabled(config: Config) -> bool:
+    return bool(config.enable_pixel and config.resolved_pixel_base_url())
+
+
+def public_base_url_ready(config: Config) -> bool:
+    url = (config.resolved_public_base_url() or "").strip().lower()
+    return bool(
+        url.startswith("https://")
+        or url.startswith("http://127.0.0.1")
+        or url.startswith("http://localhost")
     )
+
+
+def main_menu_rows(runtime: Runtime) -> List[List[str]]:
+    if tracked_email_enabled(runtime.config):
+        return [[MENU_TRACKED_EMAIL, MENU_STATS], [MENU_SETTINGS]]
+    return [[MENU_STATS, MENU_SETTINGS]]
+
+
+def main_menu_keyboard(runtime: Runtime) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(main_menu_rows(runtime), resize_keyboard=True)
+
+
+def reply_body_for_action(state: EmailState, action: str) -> str:
+    saved_reply = state.ai_body.strip()
+    if saved_reply:
+        return saved_reply
+    if action == "send":
+        return state.body.strip()
+    return localized_manual_reply_placeholder(state.lang)
+
+
+def setup_next_action(runtime: Runtime) -> tuple[str | None, str]:
+    if not ai_configured(runtime.config):
+        return "google_api_key", "Aggiungi Gemini key"
+    if not public_base_url_ready(runtime.config):
+        return "public_base_url", "Imposta Public URL"
+    if not google_credentials_available(runtime.config):
+        return "oauth_json", "Carica OAuth JSON"
+    if not google_token_available(runtime.config):
+        return "gmail_login", "Collega Gmail"
+    return None, "Setup completato"
+
+
+def setup_status_text(runtime: Runtime) -> str:
+    lines = ["Stato rapido setup:", ""] + [f"- {line}" for line in setup_status_lines(runtime)]
+    return "\n".join(lines)
+
+
+def help_message_text(runtime: Runtime) -> str:
+    lines = [
+        "Comandi principali:",
+        "",
+        "/start - registra l'owner e apre il wizard",
+        "/setup - mostra solo il prossimo step da completare",
+        "/menu - riapre la tastiera Telegram",
+        "/settings - impostazioni rapide",
+        "/status - stato rapido della configurazione",
+        "/gmail_login - ricollega Gmail",
+        "/dashboard - apre la dashboard privata",
+        "/help - mostra questo elenco",
+    ]
+    if tracked_email_enabled(runtime.config):
+        lines.append("/tracked - crea una bozza email tracciata")
+        lines.append("/stats - mostra le email tracciate")
+    else:
+        lines.append("/stats - mostra le statistiche email tracciate")
+    return "\n".join(lines)
 
 
 def gmail_call(runtime: Runtime, fn: Callable[[Any], Any]) -> Any:
@@ -1876,18 +1949,11 @@ def setup_status_lines(runtime: Runtime) -> List[str]:
 
 
 def setup_keyboard(runtime: Runtime) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton("Status", callback_data="setup|status"),
-            InlineKeyboardButton("Gemini key", callback_data="setup|google_api_key"),
-        ],
-        [
-            InlineKeyboardButton("Public URL", callback_data="setup|public_base_url"),
-            InlineKeyboardButton("Upload Google OAuth JSON", callback_data="setup|oauth_json"),
-        ],
-    ]
-    if google_credentials_available(runtime.config):
-        rows.append([InlineKeyboardButton("Connect Gmail", callback_data="setup|gmail_login")])
+    action, label = setup_next_action(runtime)
+    rows: List[List[InlineKeyboardButton]] = []
+    if action is not None:
+        rows.append([InlineKeyboardButton(label, callback_data=f"setup|{action}")])
+    rows.append([InlineKeyboardButton("Status", callback_data="setup|status")])
     rows.append([InlineKeyboardButton("Open dashboard", callback_data="setup|dashboard")])
     return InlineKeyboardMarkup(rows)
 
@@ -1954,21 +2020,36 @@ def stats_keyboard() -> InlineKeyboardMarkup:
 
 
 def setup_message_text(runtime: Runtime) -> str:
-    redirect_uri = google_oauth_redirect_url(runtime.config)
-    lines = ["Self-hosted setup status:", ""] + [f"- {line}" for line in setup_status_lines(runtime)]
-    lines.extend(
-        [
-            "",
-            "Quick flow:",
-            "1. Send /start to claim the bot owner if it is still unclaimed.",
-            "2. Set the Gemini key.",
-            "3. Set the public base URL of this app.",
-            "4. Upload the Google OAuth Web client JSON.",
-            f"5. In Google Cloud Console, add this redirect URI: {redirect_uri}",
-            "6. Tap Connect Gmail and finish the Google login in the browser.",
-        ]
+    action, _label = setup_next_action(runtime)
+    if action == "google_api_key":
+        return (
+            "Wizard setup:\n\n"
+            "Prossimo step: aggiungi la Gemini key.\n"
+            "Serve per Analizza AI e per le proposte di risposta automatiche."
+        )
+    if action == "public_base_url":
+        return (
+            "Wizard setup:\n\n"
+            "Prossimo step: imposta la Public URL.\n"
+            "Serve per dashboard privata e callback OAuth di Gmail."
+        )
+    if action == "oauth_json":
+        return (
+            "Wizard setup:\n\n"
+            "Prossimo step: carica il JSON OAuth Google.\n"
+            "Usa un client di tipo Web application e poi premi il bottone qui sotto."
+        )
+    if action == "gmail_login":
+        return (
+            "Wizard setup:\n\n"
+            "Prossimo step: collega Gmail.\n"
+            f"Redirect URI da autorizzare su Google Cloud:\n{google_oauth_redirect_url(runtime.config)}"
+        )
+    return (
+        "Wizard setup:\n\n"
+        "Configurazione principale completata.\n"
+        "Ora puoi usare Impostazioni o /dashboard per cartelle Gmail, pixel e prompt Gemini."
     )
-    return "\n".join(lines)
 
 
 def startup_notice_text(runtime: Runtime, gmail_error: str | None = None) -> str | None:
@@ -2714,7 +2795,7 @@ def kb_main(tg_message_id: int, starred: bool, attachments: List[dict]) -> Inlin
         ],
         [
             InlineKeyboardButton("🤖 Analizza AI", callback_data=f"analyze|{tg_message_id}"),
-            InlineKeyboardButton("✏️ Prompt AI", callback_data=f"ask|{tg_message_id}"),
+            InlineKeyboardButton("✏️ Scrivi manuale", callback_data=f"manual|{tg_message_id}"),
         ],
         [
             InlineKeyboardButton("❌ Rifiuta", callback_data=f"reject|{tg_message_id}"),
@@ -2846,8 +2927,8 @@ async def send_setup_message(message, runtime: Runtime, text: str | None = None)
     )
 
 
-async def send_main_menu(message, text: str = "Menu pronto.") -> None:
-    await message.reply_text(text, reply_markup=main_menu_keyboard())
+async def send_main_menu(message, runtime: Runtime, text: str = "Menu pronto.") -> None:
+    await message.reply_text(text, reply_markup=main_menu_keyboard(runtime))
 
 
 async def send_settings_message(message, runtime: Runtime, text: str | None = None) -> None:
@@ -2938,14 +3019,28 @@ async def ai_reply_stream(
         accumulated += chunk
         if len(accumulated) >= TELEGRAM_MAX:
             break
-        await safe_edit(progress, text=format_email_text(state, body_override=accumulated))
+        await safe_edit(
+            progress,
+            text=format_email_text(
+                state,
+                body_override=accumulated,
+                status_line="Analisi AI in corso…",
+            ),
+        )
         await asyncio.sleep(0.4)
 
     final_text = accumulated[:TELEGRAM_MAX]
     state.ai_body = final_text
     runtime.store.update_ai_body(state.tg_message_id, final_text)
     runtime.store.purge_old_rows(runtime.config.state_retention_days)
-    await safe_edit(progress, text=format_email_text(state, body_override=final_text))
+    await safe_edit(
+        progress,
+        text=format_email_text(
+            state,
+            body_override=final_text,
+            status_line="Proposta AI pronta. Premi Invia o Bozza.",
+        ),
+    )
 
 
 def validate_email_address(raw: str) -> str:
@@ -2987,7 +3082,7 @@ async def create_tracked_draft(
         parse_mode=ParseMode.HTML,
     )
     tracking_markup = build_tracking_markup_for_message_id(runtime.config, placeholder.message_id)
-    raw = build_raw(recipient, subject, "", tracking_markup)
+    raw = build_raw(recipient, subject, localized_manual_reply_placeholder(runtime.config.lang), tracking_markup)
     try:
         draft_payload = await asyncio.to_thread(runtime.gmail.create_draft, raw, "")
     except Exception as exc:
@@ -3023,7 +3118,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await deny_unauthorized(update)
         return
     runtime = get_runtime(context.application)
-    await send_main_menu(update.effective_message, "Menu Telegram attivato.")
+    await send_main_menu(update.effective_message, runtime, "Menu Telegram attivato.")
     await send_setup_message(
         update.effective_message,
         runtime,
@@ -3037,21 +3132,22 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await deny_unauthorized(update)
         return
     runtime = get_runtime(context.application)
-    await send_main_menu(update.effective_message)
+    await send_main_menu(update.effective_message, runtime)
     await send_setup_message(update.effective_message, runtime)
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update, context):
         return
-    await send_main_menu(update.effective_message)
+    runtime = get_runtime(context.application)
+    await send_main_menu(update.effective_message, runtime)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update, context):
         return
     runtime = get_runtime(context.application)
-    await send_setup_message(update.effective_message, runtime)
+    await send_setup_message(update.effective_message, runtime, setup_status_text(runtime))
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3087,6 +3183,13 @@ async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ),
         disable_web_page_preview=True,
     )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update, context):
+        return
+    runtime = get_runtime(context.application)
+    await update.effective_message.reply_text(help_message_text(runtime), disable_web_page_preview=True)
 
 
 async def cmd_gmail_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3152,7 +3255,7 @@ async def handle_setup_callback(
     if query is None or query.message is None:
         return False
     if action == "status":
-        await safe_edit(query.message, text=setup_message_text(runtime), markup=setup_keyboard(runtime))
+        await safe_edit(query.message, text=setup_status_text(runtime), markup=setup_keyboard(runtime))
         await query.answer()
         return True
     if action == "dashboard":
@@ -3488,6 +3591,24 @@ async def txt_followup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         if pending.action_kind == "ask":
             await ai_reply_stream(context.application, runtime, state, message.text.strip())
+        elif pending.action_kind == "manual_reply":
+            manual_text = message.text.strip()
+            if not manual_text:
+                raise ConfigError("Scrivi un testo di risposta.")
+            state.ai_body = manual_text[:TELEGRAM_MAX]
+            runtime.store.update_ai_body(state.tg_message_id, state.ai_body)
+            runtime.store.purge_old_rows(runtime.config.state_retention_days)
+            await context.bot.send_message(
+                chat_id=runtime.config.chat_id,
+                text=format_email_text(
+                    state,
+                    body_override=state.ai_body,
+                    status_line="Bozza manuale pronta. Premi Invia o Bozza.",
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=state.tg_message_id,
+                disable_web_page_preview=True,
+            )
         elif pending.action_kind == "forward":
             await asyncio.to_thread(gmail_forward, runtime, state.gmail_message_id, message.text.strip())
             await context.bot.send_message(
@@ -3497,6 +3618,11 @@ async def txt_followup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
     except Exception as exc:
         LOGGER.exception("Follow-up action failed.")
+        runtime.store.add_pending_action(
+            message.reply_to_message.message_id,
+            pending.root_tg_message_id,
+            pending.action_kind,
+        )
         await context.bot.send_message(
             chat_id=runtime.config.chat_id,
             text=f"⚠️ Action err: {exc}",
@@ -3578,6 +3704,17 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer()
         return
 
+    if action == "manual":
+        prompt_message = await context.bot.send_message(
+            chat_id=runtime.config.chat_id,
+            text="✏️ Scrivi la risposta manuale (rispondi qui). La usero' per Invia o Bozza.",
+            reply_to_message_id=message.message_id,
+        )
+        runtime.store.add_pending_action(prompt_message.message_id, tg_message_id, "manual_reply")
+        runtime.store.purge_old_rows(runtime.config.state_retention_days)
+        await query.answer()
+        return
+
     if action == "analyze":
         if runtime.model is None:
             await query.answer("Gemini non configurato.", show_alert=True)
@@ -3649,19 +3786,13 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     tracking_markup = build_tracking_markup(runtime.config, state)
-    body_to_send = state.ai_body or state.body
+    body_to_send = reply_body_for_action(state, action)
 
     try:
         if action == "send":
-            if not state.ai_body:
-                await query.answer("Premi prima 🤖 Analizza AI o usa Prompt AI.", show_alert=True)
-                return
             raw = build_raw(state.sender, "Re: " + state.subject, body_to_send, tracking_markup)
             await asyncio.to_thread(runtime.gmail.send_raw_message, raw, state.gmail_thread_id)
         elif action == "draft":
-            if not state.ai_body:
-                await query.answer("Premi prima 🤖 Analizza AI o usa Prompt AI.", show_alert=True)
-                return
             raw = build_raw(state.sender, "Re: " + state.subject, body_to_send, tracking_markup)
             await asyncio.to_thread(runtime.gmail.create_draft, raw, state.gmail_thread_id)
         elif action == "trash":
@@ -3712,7 +3843,7 @@ async def process_new_email(application: Application, runtime: Runtime, gmail_me
                 starred="STARRED" in payload.get("labelIds", []),
                 lang=lang,
             ),
-            status_line="Premi 🤖 Analizza AI per generare una proposta di risposta.",
+            status_line="Premi 🤖 Analizza AI o ✏️ Scrivi manuale. Puoi anche usare 💾 Bozza per completare la reply in Gmail.",
         ),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
@@ -4031,6 +4162,7 @@ def build_application(runtime: Runtime) -> Application:
     application.add_handler(CommandHandler("config", cmd_dashboard))
     application.add_handler(CommandHandler("dashboard", cmd_dashboard))
     application.add_handler(CommandHandler("gmail_login", cmd_gmail_login))
+    application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("set", cmd_set))
     application.add_handler(CommandHandler("unset", cmd_unset))
     application.add_handler(CallbackQueryHandler(cb_btn))

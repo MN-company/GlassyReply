@@ -27,9 +27,12 @@ from tg_email import (
     claim_owner,
     create_web_app,
     gmail_initial_sync_pending,
+    help_message_text,
     google_oauth_state_payload,
     google_web_client_config,
+    localized_manual_reply_placeholder,
     mark_gmail_initial_sync_pending,
+    main_menu_rows,
     make_tracking_token,
     make_dashboard_token,
     owner_configured,
@@ -38,9 +41,12 @@ from tg_email import (
     parse_google_oauth_state_payload,
     payload_text,
     save_runtime_settings,
+    setup_keyboard,
+    setup_message_text,
     split_unseen_inbox_ids,
     start_google_oauth,
     startup_notice_text,
+    reply_body_for_action,
     tracked_email_status_summary,
     tracked_stats_text,
     verify_dashboard_token,
@@ -119,6 +125,105 @@ class ConfigTests(unittest.TestCase):
             {"GMAIL_MONITOR_LABELS": json.dumps(["INBOX", "CATEGORY_PROMOTIONS"])}
         )
         self.assertEqual(overridden.gmail_monitor_labels, ["INBOX", "CATEGORY_PROMOTIONS"])
+
+
+class AssistantUxTests(unittest.TestCase):
+    def make_runtime(self, **env_overrides) -> Runtime:
+        tmpdir = tempfile.mkdtemp()
+        base_env = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "DATA_DIR": tmpdir,
+        }
+        base_env.update(env_overrides)
+        cfg = Config.from_env(base_env)
+        store = StateStore(Path(tmpdir) / "state.db")
+        runtime = Runtime(
+            base_config=cfg,
+            config=cfg,
+            startup_overrides={},
+            store=store,
+            gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+            model=None,
+            shutdown_event=SimpleNamespace(),
+            mode="polling",
+        )
+        self.addCleanup(store.close)
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmpdir, ignore_errors=True))
+        return runtime
+
+    def test_main_menu_hides_tracked_email_until_pixel_is_enabled(self) -> None:
+        runtime = self.make_runtime()
+        self.assertEqual(main_menu_rows(runtime), [["Stats", "Impostazioni"]])
+
+        pixel_runtime = self.make_runtime(ENABLE_PIXEL="1", PIXEL_WEBHOOK_SECRET="secret")
+        self.assertEqual(
+            main_menu_rows(pixel_runtime),
+            [["Email Tracciata", "Stats"], ["Impostazioni"]],
+        )
+
+    def test_setup_message_text_is_progressive(self) -> None:
+        runtime = self.make_runtime()
+        first_step = setup_message_text(runtime)
+        self.assertIn("Gemini key", first_step)
+        self.assertNotIn("OAuth Google", first_step)
+
+        oauth_runtime = self.make_runtime(GOOGLE_API_KEY="gemini")
+        second_step = setup_message_text(oauth_runtime)
+        self.assertIn("OAuth Google", second_step)
+        self.assertNotIn("collega Gmail", second_step)
+
+        gmail_runtime = self.make_runtime(
+            GOOGLE_API_KEY="gemini",
+            GOOGLE_OAUTH_CREDENTIALS_JSON='{"web":{"client_id":"x","project_id":"p","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","client_secret":"secret"}}',
+            PUBLIC_BASE_URL="https://glassyreply-bot.fly.dev",
+        )
+        third_step = setup_message_text(gmail_runtime)
+        self.assertIn("collega Gmail", third_step)
+        self.assertIn("https://glassyreply-bot.fly.dev/oauth/google/callback", third_step)
+
+    def test_setup_keyboard_shows_only_next_action_plus_status_and_dashboard(self) -> None:
+        runtime = self.make_runtime()
+        markup = setup_keyboard(runtime)
+        callback_data = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertIn("setup|google_api_key", callback_data)
+        self.assertIn("setup|status", callback_data)
+        self.assertIn("setup|dashboard", callback_data)
+        self.assertNotIn("setup|oauth_json", callback_data)
+        self.assertNotIn("setup|gmail_login", callback_data)
+
+    def test_help_message_lists_short_commands(self) -> None:
+        runtime = self.make_runtime()
+        help_text = help_message_text(runtime)
+        self.assertIn("/setup - mostra solo il prossimo step", help_text)
+        self.assertIn("/help - mostra questo elenco", help_text)
+        self.assertNotIn("/tracked -", help_text)
+
+        pixel_runtime = self.make_runtime(ENABLE_PIXEL="1", PIXEL_WEBHOOK_SECRET="secret")
+        self.assertIn("/tracked - crea una bozza email tracciata", help_message_text(pixel_runtime))
+
+    def test_reply_body_for_action_uses_ai_then_original_then_editable_placeholder(self) -> None:
+        state = EmailState(
+            tg_message_id=1,
+            gmail_message_id="gmail-1",
+            gmail_thread_id="thread-1",
+            sender="sender@example.com",
+            subject="Subject",
+            body="Original body",
+            header="Header",
+            attachments=[],
+            starred=False,
+            lang="it",
+            ai_body="Reply pronta",
+        )
+        self.assertEqual(reply_body_for_action(state, "send"), "Reply pronta")
+        self.assertEqual(reply_body_for_action(state, "draft"), "Reply pronta")
+
+        state.ai_body = ""
+        self.assertEqual(reply_body_for_action(state, "send"), "Original body")
+        self.assertEqual(
+            reply_body_for_action(state, "draft"),
+            localized_manual_reply_placeholder("it"),
+        )
 
 
 class StateStoreTests(unittest.TestCase):
