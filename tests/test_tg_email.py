@@ -17,9 +17,13 @@ from tg_email import (
     StateStore,
     build_candidate_config,
     build_application,
+    claim_owner,
     create_web_app,
+    google_web_client_config,
     make_dashboard_token,
+    owner_configured,
     is_authorized_update,
+    save_runtime_settings,
     verify_dashboard_token,
 )
 
@@ -50,6 +54,15 @@ class ConfigTests(unittest.TestCase):
                     "GOOGLE_API_KEY": "gemini",
                 }
             )
+
+    def test_missing_chat_id_defaults_to_zero(self) -> None:
+        cfg = Config.from_env(
+            {
+                "TELEGRAM_BOT_TOKEN": "token",
+                "GOOGLE_API_KEY": "gemini",
+            }
+        )
+        self.assertEqual(cfg.chat_id, 0)
 
 
 class StateStoreTests(unittest.TestCase):
@@ -105,6 +118,71 @@ class StateStoreTests(unittest.TestCase):
             store.delete_app_setting("LANG")
             self.assertNotIn("LANG", store.get_app_settings())
             store.close()
+
+
+class SelfHostedSetupTests(unittest.TestCase):
+    def test_claim_owner_persists_in_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Config.from_env(
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "GOOGLE_API_KEY": "",
+                    "DATA_DIR": tmpdir,
+                }
+            )
+            store = StateStore(Path(tmpdir) / "state.db")
+            runtime = Runtime(
+                base_config=cfg,
+                config=cfg,
+                startup_overrides={},
+                store=store,
+                gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+                model=None,
+                shutdown_event=SimpleNamespace(),
+                mode="polling",
+            )
+            claim_owner(runtime, 555)
+            self.assertTrue(owner_configured(runtime.config))
+            self.assertEqual(runtime.config.chat_id, 555)
+            self.assertEqual(store.get_app_settings()["TELEGRAM_CHAT_ID"], "555")
+            store.close()
+
+    def test_google_web_client_config_requires_web_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Config.from_env(
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "DATA_DIR": tmpdir,
+                }
+            )
+            runtime = Runtime(
+                base_config=cfg,
+                config=cfg,
+                startup_overrides={},
+                store=StateStore(Path(tmpdir) / "state.db"),
+                gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+                model=None,
+                shutdown_event=SimpleNamespace(),
+                mode="polling",
+            )
+            try:
+                with self.assertRaises(ConfigError):
+                    save_runtime_settings(
+                        runtime,
+                        {
+                            "GOOGLE_OAUTH_CREDENTIALS_JSON": '{"installed":{"client_id":"x","project_id":"p"}}'
+                        },
+                    )
+                save_runtime_settings(
+                    runtime,
+                    {
+                        "GOOGLE_OAUTH_CREDENTIALS_JSON": '{"web":{"client_id":"x","project_id":"p","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","client_secret":"secret","redirect_uris":["http://127.0.0.1:8080/oauth/google/callback"]}}'
+                    },
+                )
+                loaded = google_web_client_config(runtime.config)
+                self.assertIn("web", loaded)
+            finally:
+                runtime.store.close()
 
 
 class AuthGuardTests(unittest.TestCase):

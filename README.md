@@ -32,9 +32,10 @@ It watches Gmail, forwards each new inbox message to Telegram, streams a Gemini 
 
 - SQLite replaced in-memory bot state.
 - Gmail API calls now self-heal on `401/403` by rebuilding the client and retrying once.
-- Telegram access is locked to the configured owner user ID.
+- Telegram access is locked to the claimed owner user ID.
 - Configuration is centralized in `Config.from_env()`.
 - Runtime config is persisted in SQLite and edited from the dashboard, not by hand in `.env`.
+- The first Telegram `/start` can claim the bot owner, and `/setup` can finish most of the configuration in-chat.
 - Bot runtime supports `--mode polling` and `--mode webhook`.
 - Docker, Docker Compose, Fly.io config, tests, and first-run docs were added.
 - Pixel tracking moved from a single raw image URL to a signed multilayer bundle:
@@ -46,9 +47,10 @@ It watches Gmail, forwards each new inbox message to Telegram, streams a Gemini 
 ## Requirements
 
 - Python 3.11+ recommended
-- Gmail API OAuth desktop credentials
-- Telegram bot token and your Telegram user ID
-- Gemini API key
+- Google OAuth Web client credentials for Gmail
+- Telegram bot token
+- Optional bootstrap owner Telegram user ID
+- Optional bootstrap Gemini API key
 - Optional: Cloudflare account for the Worker-based pixel tracker
 - Optional: Fly.io CLI for bot deployment
 
@@ -71,10 +73,18 @@ cp .env.example .env
 Required values:
 
 - `TELEGRAM_BOT_TOKEN`
+
+Optional bootstrap values:
+
 - `TELEGRAM_CHAT_ID`
 - `GOOGLE_API_KEY`
+- `GOOGLE_OAUTH_CREDENTIALS_JSON`
+- `GOOGLE_OAUTH_TOKEN_JSON`
 
-The dashboard can edit the runtime knobs later, but these bootstrap values still need to be present at startup.
+If you leave them empty, the bot can still start. Then:
+
+- the first Telegram user who sends `/start` claims ownership
+- `/setup` guides the rest of the configuration
 
 Recommended local paths:
 
@@ -91,33 +101,50 @@ Optional runtime values:
 - `TELEGRAM_WEBHOOK_URL=https://your-public-host`
 - `TELEGRAM_WEBHOOK_SECRET=telegram-secret`
 
-### 3. Add Gmail OAuth credentials
+### 3. Configure from Telegram
 
-Create a Google Cloud desktop OAuth client with Gmail scopes enabled, then either:
-
-- place the downloaded JSON at `./data/credentials.json`, or
-- set `GOOGLE_OAUTH_CREDENTIALS_JSON` to the full JSON string
-
-### 4. First OAuth flow
-
-The first run needs browser-based Gmail authorization.
+Start the bot:
 
 ```bash
 python3 tg_email.py --mode polling
 ```
 
+Then in Telegram:
+
+1. Send `/start` to claim the bot owner.
+2. Send `/setup` to see the setup checklist.
+3. Set `PUBLIC_BASE_URL` if the bot runs on Fly or another public host.
+4. Set the Gemini key from the bot or with `/set google_api_key ...`.
+5. Upload the Google OAuth Web client JSON from the setup flow.
+6. Tap `Connect Gmail` or use `/gmail_login`.
+
+### 4. Google OAuth for Gmail
+
+For the bot-based Gmail login you need a Google OAuth client of type `Web application`, not `Desktop app`.
+
+The redirect URI must include:
+
+- `https://your-domain.example/oauth/google/callback`
+
+or on Fly:
+
+- `https://glassyreply-bot.fly.dev/oauth/google/callback`
+
+After you upload the JSON and tap `Connect Gmail`, Google redirects back to the bot callback URL and the refresh token is stored automatically.
+
 What happens:
 
-1. The app opens the local OAuth flow.
-2. You grant Gmail access once.
-3. `token.json` is created under `DATA_DIR`.
-4. Future runs refresh tokens automatically.
+1. The bot generates a Google authorization URL.
+2. You log in with Google in the browser.
+3. Google redirects back to `/oauth/google/callback`.
+4. The bot stores the token in SQLite and `/app/data/token.json`.
+5. Future runs refresh tokens automatically.
 
-If you already have a working local `token.json`, you can also bootstrap remote hosts with `GOOGLE_OAUTH_TOKEN_JSON`. The app writes it only when the token file is missing, so later refreshes still persist to disk.
+You can still bootstrap remote hosts with `GOOGLE_OAUTH_TOKEN_JSON` if you already have a valid token, but it is no longer the only path.
 
 ### 5. Open the dashboard
 
-After the bot is running, send `/config` or `/dashboard` to the Telegram bot.
+After the bot is running, send `/setup`, `/config`, or `/dashboard` to the Telegram bot.
 
 It replies with a signed link to the private dashboard where you can:
 
@@ -192,23 +219,36 @@ If the name is taken, pick a close variant and update [`fly.toml`](/Users/mnbrai
 ```bash
 flyctl secrets set \
   TELEGRAM_BOT_TOKEN=... \
-  TELEGRAM_CHAT_ID=... \
-  GOOGLE_API_KEY=... \
-  GOOGLE_OAUTH_CREDENTIALS_JSON="$(cat credentials.json)" \
-  GOOGLE_OAUTH_TOKEN_JSON="$(cat data/token.json)" \
   --app glassyreply-bot
 ```
 
-You can leave pixel and other runtime knobs for the dashboard after the app is live.
+Optional bootstrap secrets you can add now or later from the bot:
+
+- `TELEGRAM_CHAT_ID`
+- `GOOGLE_API_KEY`
+- `GOOGLE_OAUTH_CREDENTIALS_JSON`
+- `GOOGLE_OAUTH_TOKEN_JSON`
+- pixel-related secrets
+
+You can leave most runtime knobs for `/setup`, `/set`, or the dashboard after the app is live.
 
 ### 3. Bootstrap `token.json`
 
-Fly cannot complete the desktop OAuth flow by itself. Recommended bootstrap:
+If you prefer not to paste OAuth secrets into Fly, you can deploy first and then finish setup from Telegram:
+
+1. Set only `TELEGRAM_BOT_TOKEN`.
+2. Deploy the app.
+3. Claim ownership with `/start`.
+4. Run `/setup`.
+5. Upload the Google OAuth Web client JSON.
+6. Complete `/gmail_login` in the browser.
+
+If you already have a valid Gmail token and want a pre-bootstrapped deploy:
 
 1. Run the bot locally once with the same Gmail OAuth client.
 2. Confirm `data/token.json` exists.
-3. Seed `GOOGLE_OAUTH_TOKEN_JSON` as shown above.
-4. Deploy the app:
+3. Seed `GOOGLE_OAUTH_TOKEN_JSON`.
+4. Deploy the app.
 
 ```bash
 flyctl deploy --app glassyreply-bot
@@ -223,6 +263,7 @@ Fly checks:
 - `GET /healthz`
 - `GET /` public landing page
 - `GET /dashboard?token=...` private dashboard
+- `GET /oauth/google/callback` Google OAuth callback
 
 ## Pixel tracker
 

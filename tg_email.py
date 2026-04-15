@@ -26,7 +26,7 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow, InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import google.generativeai as genai
@@ -60,6 +60,7 @@ TELEGRAM_MAX = 4_000
 PAGE_SIZE = 30
 STATE_RETENTION_DAYS = 30
 LAST_SEEN_KEY = "last_seen_gmail_message_id"
+GOOGLE_OAUTH_STATE_KEY = "google_oauth_pending_state"
 PREDEF_FWD = ["redazione@example.com", "boss@example.com"]
 DEFAULT_PROMPT = (
     "Sei un assistente professionale. Scrivi una risposta "
@@ -148,10 +149,13 @@ class Config:
         chat_id_raw = source.get("TELEGRAM_CHAT_ID", "").strip()
         google_api_key = source.get("GOOGLE_API_KEY", "").strip()
         fly_app_name = source.get("FLY_APP_NAME", "").strip()
-        try:
-            chat_id = int(chat_id_raw)
-        except ValueError as exc:
-            raise ConfigError("TELEGRAM_CHAT_ID must be integer") from exc
+        if chat_id_raw:
+            try:
+                chat_id = int(chat_id_raw)
+            except ValueError as exc:
+                raise ConfigError("TELEGRAM_CHAT_ID must be integer") from exc
+        else:
+            chat_id = 0
 
         public_base_url = source.get("PUBLIC_BASE_URL", "").strip()
         if not public_base_url:
@@ -182,10 +186,6 @@ class Config:
 
         if not bot_token:
             raise ConfigError("Missing TELEGRAM_BOT_TOKEN")
-        if chat_id <= 0:
-            raise ConfigError("TELEGRAM_CHAT_ID must be > 0")
-        if not google_api_key:
-            raise ConfigError("Missing GOOGLE_API_KEY")
         try:
             port = int(port_raw)
         except ValueError as exc:
@@ -257,8 +257,8 @@ class Config:
         self.validate_effective(mode)
 
     def validate_effective(self, mode: str | None = None) -> None:
-        if self.chat_id <= 0:
-            raise ConfigError("TELEGRAM_CHAT_ID must be > 0")
+        if self.chat_id < 0:
+            raise ConfigError("TELEGRAM_CHAT_ID must be >= 0")
         if self.port <= 0:
             raise ConfigError("PORT must be > 0")
         if self.watch_interval <= 0:
@@ -288,6 +288,8 @@ class Config:
             return self
 
         data = {
+            "chat_id": self.chat_id,
+            "google_api_key": self.google_api_key,
             "enable_pixel": self.enable_pixel,
             "pixel_base_url": self.pixel_base_url,
             "pixel_webhook_secret": self.pixel_webhook_secret,
@@ -300,12 +302,22 @@ class Config:
             "predef_fwd": list(self.predef_fwd),
             "state_retention_days": self.state_retention_days,
             "public_base_url": self.public_base_url,
+            "google_oauth_credentials_json": self.google_oauth_credentials_json,
+            "google_oauth_token_json": self.google_oauth_token_json,
             "telegram_webhook_url": self.telegram_webhook_url,
             "telegram_webhook_secret": self.telegram_webhook_secret,
         }
 
+        if "TELEGRAM_CHAT_ID" in overrides:
+            data["chat_id"] = parse_int(overrides["TELEGRAM_CHAT_ID"], data["chat_id"])
+        if "GOOGLE_API_KEY" in overrides:
+            data["google_api_key"] = overrides["GOOGLE_API_KEY"].strip()
         if "PUBLIC_BASE_URL" in overrides:
             data["public_base_url"] = overrides["PUBLIC_BASE_URL"].strip() or data["public_base_url"]
+        if "GOOGLE_OAUTH_CREDENTIALS_JSON" in overrides:
+            data["google_oauth_credentials_json"] = overrides["GOOGLE_OAUTH_CREDENTIALS_JSON"].strip()
+        if "GOOGLE_OAUTH_TOKEN_JSON" in overrides:
+            data["google_oauth_token_json"] = overrides["GOOGLE_OAUTH_TOKEN_JSON"].strip()
         if "ENABLE_PIXEL" in overrides:
             data["enable_pixel"] = parse_bool(overrides["ENABLE_PIXEL"], data["enable_pixel"])
         if "PIXEL_BASE_URL" in overrides:
@@ -390,6 +402,21 @@ class PendingAction:
         )
 
 
+@dataclass(slots=True)
+class InteractivePrompt:
+    prompt_message_id: int
+    action_kind: str
+    created_at: str
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "InteractivePrompt":
+        return cls(
+            prompt_message_id=row["prompt_message_id"],
+            action_kind=row["action_kind"],
+            created_at=row["created_at"],
+        )
+
+
 class StateStore:
     def __init__(self, path: Path):
         self.path = path
@@ -430,6 +457,12 @@ class StateStore:
                     FOREIGN KEY(root_tg_message_id) REFERENCES email_state(tg_message_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS interactive_prompts (
+                    prompt_message_id INTEGER PRIMARY KEY,
+                    action_kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
                     value TEXT,
@@ -448,6 +481,7 @@ class StateStore:
         cutoff = (utcnow() - timedelta(days=days)).isoformat()
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM pending_actions WHERE created_at < ?", (cutoff,))
+            self._conn.execute("DELETE FROM interactive_prompts WHERE created_at < ?", (cutoff,))
             self._conn.execute("DELETE FROM email_state WHERE updated_at < ?", (cutoff,))
             self._conn.execute(
                 """
@@ -554,6 +588,33 @@ class StateStore:
                 (prompt_message_id,),
             )
         return PendingAction.from_row(row)
+
+    def add_interactive_prompt(self, prompt_message_id: int, action_kind: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO interactive_prompts (prompt_message_id, action_kind, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(prompt_message_id) DO UPDATE SET
+                    action_kind=excluded.action_kind,
+                    created_at=excluded.created_at
+                """,
+                (prompt_message_id, action_kind, utcnow_iso()),
+            )
+
+    def pop_interactive_prompt(self, prompt_message_id: int) -> InteractivePrompt | None:
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM interactive_prompts WHERE prompt_message_id = ?",
+                (prompt_message_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                "DELETE FROM interactive_prompts WHERE prompt_message_id = ?",
+                (prompt_message_id,),
+            )
+        return InteractivePrompt.from_row(row)
 
     def set_bot_state(self, key: str, value: str) -> None:
         with self._lock, self._conn:
@@ -977,7 +1038,15 @@ def apply_runtime_overrides(runtime: Runtime) -> None:
     merged = runtime.base_config.with_overrides(runtime.startup_overrides).with_overrides(overrides)
     merged.validate_effective(runtime.mode)
     runtime.config = merged
-    runtime.model = genai.GenerativeModel(runtime.config.ai_model)
+    runtime.gmail.config = runtime.config
+    runtime.config.materialize_google_credentials()
+    runtime.config.materialize_gmail_token()
+    runtime.gmail.invalidate()
+    if runtime.config.google_api_key:
+        genai.configure(api_key=runtime.config.google_api_key)
+        runtime.model = genai.GenerativeModel(runtime.config.ai_model)
+    else:
+        runtime.model = None
 
 
 def build_candidate_config(runtime: Runtime, overrides: Mapping[str, str]) -> Config:
@@ -1017,6 +1086,172 @@ def parse_dashboard_overrides(form_data: Mapping[str, Any], current: Mapping[str
         else:
             overrides.pop(field.key, None)
     return overrides
+
+
+def owner_configured(config: Config) -> bool:
+    return config.chat_id > 0
+
+
+def ai_configured(config: Config) -> bool:
+    return bool(config.google_api_key)
+
+
+def google_credentials_available(config: Config) -> bool:
+    return bool(config.google_oauth_credentials_json) or config.gmail_credentials_path.exists()
+
+
+def google_token_available(config: Config) -> bool:
+    return bool(config.google_oauth_token_json) or config.gmail_token_path.exists()
+
+
+def gmail_ready_for_watch(config: Config) -> bool:
+    return owner_configured(config) and google_credentials_available(config) and google_token_available(config)
+
+
+def google_oauth_redirect_url(config: Config) -> str:
+    return config.resolved_public_base_url() + "/oauth/google/callback"
+
+
+def google_client_config(config: Config) -> dict:
+    if config.google_oauth_credentials_json:
+        return json.loads(config.google_oauth_credentials_json)
+    if config.gmail_credentials_path.exists():
+        return json.loads(config.gmail_credentials_path.read_text())
+    raise ConfigError("Google OAuth client JSON not configured yet.")
+
+
+def google_web_client_config(config: Config) -> dict:
+    client_config = google_client_config(config)
+    web_config = client_config.get("web")
+    if not isinstance(web_config, dict):
+        raise ConfigError(
+            "Bot-based Gmail login needs a Google OAuth Web application JSON under the 'web' key."
+        )
+    redirect_uri = google_oauth_redirect_url(config)
+    redirect_uris = web_config.get("redirect_uris") or []
+    if redirect_uri not in redirect_uris:
+        raise ConfigError(
+            f"Add {redirect_uri} to the Google OAuth redirect URIs before connecting Gmail."
+        )
+    return client_config
+
+
+def setup_status_lines(runtime: Runtime) -> List[str]:
+    config = runtime.config
+    owner_line = (
+        f"Owner Telegram ID: {config.chat_id}"
+        if owner_configured(config)
+        else "Owner Telegram ID: not claimed yet"
+    )
+    return [
+        owner_line,
+        f"Gemini API key: {'set' if ai_configured(config) else 'missing'}",
+        f"Public base URL: {config.resolved_public_base_url() or 'missing'}",
+        f"Google OAuth client JSON: {'set' if google_credentials_available(config) else 'missing'}",
+        f"Gmail refresh token: {'set' if google_token_available(config) else 'missing'}",
+        f"Pixel tracking: {'enabled' if config.enable_pixel else 'disabled'}",
+    ]
+
+
+def setup_keyboard(runtime: Runtime) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("Status", callback_data="setup|status"),
+            InlineKeyboardButton("Gemini key", callback_data="setup|google_api_key"),
+        ],
+        [
+            InlineKeyboardButton("Public URL", callback_data="setup|public_base_url"),
+            InlineKeyboardButton("Upload Google OAuth JSON", callback_data="setup|oauth_json"),
+        ],
+    ]
+    if google_credentials_available(runtime.config):
+        rows.append([InlineKeyboardButton("Connect Gmail", callback_data="setup|gmail_login")])
+    rows.append([InlineKeyboardButton("Open dashboard", callback_data="setup|dashboard")])
+    return InlineKeyboardMarkup(rows)
+
+
+def setup_message_text(runtime: Runtime) -> str:
+    lines = ["Self-hosted setup status:", ""] + [f"- {line}" for line in setup_status_lines(runtime)]
+    lines.extend(
+        [
+            "",
+            "Quick flow:",
+            "1. Send /start to claim the bot owner if it is still unclaimed.",
+            "2. Set the Gemini key.",
+            "3. Set the public base URL of this app.",
+            "4. Upload the Google OAuth Web client JSON.",
+            "5. Tap Connect Gmail and finish the Google login in the browser.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def save_runtime_settings(runtime: Runtime, updates: Mapping[str, str]) -> None:
+    current = runtime.store.get_app_settings()
+    merged = dict(current)
+    merged.update(updates)
+    candidate = build_candidate_config(runtime, merged)
+    if "GOOGLE_OAUTH_CREDENTIALS_JSON" in updates:
+        google_web_client_config(candidate)
+    if "GOOGLE_OAUTH_TOKEN_JSON" in updates:
+        json.loads(updates["GOOGLE_OAUTH_TOKEN_JSON"])
+    for key, value in updates.items():
+        runtime.store.set_app_setting(key, value)
+    apply_runtime_overrides(runtime)
+
+
+def claim_owner(runtime: Runtime, user_id: int) -> None:
+    save_runtime_settings(runtime, {"TELEGRAM_CHAT_ID": str(user_id)})
+
+
+def clear_google_oauth_state(runtime: Runtime) -> None:
+    runtime.store.set_bot_state(GOOGLE_OAUTH_STATE_KEY, "")
+
+
+def start_google_oauth(runtime: Runtime) -> str:
+    client_config = google_web_client_config(runtime.config)
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        redirect_uri=google_oauth_redirect_url(runtime.config),
+    )
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    payload = {"state": state, "created_at": utcnow_iso()}
+    runtime.store.set_bot_state(GOOGLE_OAUTH_STATE_KEY, json.dumps(payload))
+    return auth_url
+
+
+BOT_CONFIG_ALIASES = {
+    "owner_chat_id": "TELEGRAM_CHAT_ID",
+    "telegram_chat_id": "TELEGRAM_CHAT_ID",
+    "google_api_key": "GOOGLE_API_KEY",
+    "public_base_url": "PUBLIC_BASE_URL",
+    "enable_pixel": "ENABLE_PIXEL",
+    "pixel_base_url": "PIXEL_BASE_URL",
+    "pixel_webhook_secret": "PIXEL_WEBHOOK_SECRET",
+    "pixel_webhook_url": "PIXEL_WEBHOOK_URL",
+    "watch_interval": "WATCH_INTERVAL",
+    "lang": "LANG",
+    "ai_model": "AI_MODEL",
+    "predef_fwd": "PREDEF_FWD",
+    "state_retention_days": "STATE_RETENTION_DAYS",
+    "telegram_webhook_url": "TELEGRAM_WEBHOOK_URL",
+    "telegram_webhook_secret": "TELEGRAM_WEBHOOK_SECRET",
+    "google_oauth_credentials_json": "GOOGLE_OAUTH_CREDENTIALS_JSON",
+    "google_oauth_token_json": "GOOGLE_OAUTH_TOKEN_JSON",
+}
+
+
+def normalize_bot_config_key(raw: str) -> str:
+    key = raw.strip().lower()
+    normalized = BOT_CONFIG_ALIASES.get(key)
+    if not normalized:
+        raise ConfigError(f"Unsupported setup key: {raw}")
+    return normalized
 
 
 def build_tracking_markup(config: Config, state: EmailState) -> str:
@@ -1257,53 +1492,54 @@ def build_runtime_rows(runtime: Runtime) -> List[dict]:
 
 
 def build_bootstrap_rows(runtime: Runtime) -> List[dict]:
-    base = runtime.base_config
+    config = runtime.config
+    overrides = runtime.store.get_app_settings()
     rows = [
         {
             "label": "Telegram bot token",
-            "value": mask_secret(base.bot_token),
+            "value": mask_secret(config.bot_token),
             "source": "env",
             "note": "Required to talk to Telegram.",
             "secret": True,
         },
         {
-            "label": "Telegram chat ID",
-            "value": str(base.chat_id),
-            "source": "env",
-            "note": "Only this user can control the bot.",
+            "label": "Telegram owner ID",
+            "value": str(config.chat_id) if owner_configured(config) else "missing",
+            "source": "saved" if "TELEGRAM_CHAT_ID" in overrides else "env",
+            "note": "The first /start can claim the owner automatically.",
         },
         {
             "label": "Google API key",
-            "value": "set" if base.google_api_key else "missing",
-            "source": "env",
-            "note": "Used for Gemini requests.",
+            "value": "set" if config.google_api_key else "missing",
+            "source": "saved" if "GOOGLE_API_KEY" in overrides else "env",
+            "note": "Used for Gemini requests and configurable from Telegram.",
             "secret": True,
         },
         {
             "label": "OAuth credentials JSON",
-            "value": "set" if base.google_oauth_credentials_json else "missing",
-            "source": "env",
-            "note": "Bootstrap client JSON for Gmail OAuth.",
+            "value": "set" if config.google_oauth_credentials_json or config.gmail_credentials_path.exists() else "missing",
+            "source": "saved" if "GOOGLE_OAUTH_CREDENTIALS_JSON" in overrides else "env/filesystem",
+            "note": "Google OAuth Web client JSON for Gmail login.",
             "secret": True,
         },
         {
             "label": "OAuth token JSON",
-            "value": "set" if base.google_oauth_token_json else "missing",
-            "source": "env",
-            "note": "Optional token bootstrap blob for first launch.",
+            "value": "set" if config.google_oauth_token_json or config.gmail_token_path.exists() else "missing",
+            "source": "saved" if "GOOGLE_OAUTH_TOKEN_JSON" in overrides else "env/filesystem",
+            "note": "Stored after the browser-based Gmail OAuth flow.",
             "secret": True,
         },
         {
             "label": "Gmail token file",
-            "value": "present" if base.gmail_token_path.exists() else "missing",
+            "value": "present" if config.gmail_token_path.exists() else "missing",
             "source": "filesystem",
             "note": "Refreshed token saved on disk.",
         },
         {
             "label": "Gmail credentials file",
-            "value": "present" if base.gmail_credentials_path.exists() else "missing",
+            "value": "present" if config.gmail_credentials_path.exists() else "missing",
             "source": "filesystem",
-            "note": "Desktop OAuth client JSON.",
+            "note": "OAuth client JSON materialized on disk.",
         },
     ]
     return rows
@@ -1491,7 +1727,7 @@ def dashboard_page(
         </div>
         <div class="card">
           <h2>How to open</h2>
-          <p class="mini">Use the Telegram command <code>/config</code> or <code>/dashboard</code> to receive a signed link. That keeps the page private without needing to edit env vars.</p>
+          <p class="mini">Use the Telegram command <code>/setup</code>, <code>/config</code>, or <code>/dashboard</code> to receive the private controls for this bot.</p>
           <p class="mini">If you change Gmail bootstrap secrets or the bot token, restart the process so the new runtime files are re-materialized.</p>
         </div>
       </div>
@@ -1564,11 +1800,11 @@ def landing_page(runtime: Runtime) -> str:
         <div class="card">
           <h2>What this page is</h2>
           <p class="mini">This public landing page only proves the app is alive. The full configuration view lives behind the signed Telegram dashboard link.</p>
-          <p class="mini">Open Telegram and send <code>/config</code> or <code>/dashboard</code> to receive the private config page.</p>
+          <p class="mini">Open Telegram and send <code>/setup</code> first if the bot is not configured yet, or <code>/config</code> / <code>/dashboard</code> once the owner is already claimed.</p>
         </div>
         <div class="card">
           <h2>Open the dashboard</h2>
-          <p class="mini">Use the Telegram command <code>/config</code> or <code>/dashboard</code> to receive a signed link. That page is protected and lets you edit the saved runtime configuration without touching `.env`.</p>
+          <p class="mini">Use <code>/setup</code> for the in-bot wizard and <code>/config</code> or <code>/dashboard</code> for the private web dashboard. Both avoid editing `.env` by hand.</p>
           <p class="mini"><a class="link" href="/healthz">/healthz</a> is the lightweight uptime check used by Fly.</p>
         </div>
         <div class="card">
@@ -1671,6 +1907,8 @@ def get_runtime(application: Application) -> Runtime:
 
 def is_authorized_update(update: Update, config: Config) -> bool:
     user = update.effective_user
+    if not owner_configured(config):
+        return False
     return bool(user and user.id == config.chat_id)
 
 
@@ -1688,12 +1926,55 @@ async def ensure_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     runtime = get_runtime(context.application)
     if is_authorized_update(update, runtime.config):
         return True
+    if not owner_configured(runtime.config):
+        message = update.effective_message
+        if message:
+            await message.reply_text("Questo bot non ha ancora un owner. Usa /start per reclamarlo.")
+        return False
     LOGGER.warning(
         "Rejected unauthorized Telegram user. user_id=%s",
         getattr(update.effective_user, "id", None),
     )
     await deny_unauthorized(update)
     return False
+
+
+async def claim_owner_if_needed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    runtime = get_runtime(context.application)
+    user = update.effective_user
+    if user is None:
+        return False
+    if owner_configured(runtime.config):
+        return user.id == runtime.config.chat_id
+    claim_owner(runtime, user.id)
+    LOGGER.info("Claimed bot owner user_id=%s", user.id)
+    return True
+
+
+async def send_setup_message(message, runtime: Runtime, text: str | None = None) -> None:
+    await message.reply_text(
+        text or setup_message_text(runtime),
+        reply_markup=setup_keyboard(runtime),
+        disable_web_page_preview=True,
+    )
+
+
+async def prompt_for_setup_value(
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime: Runtime,
+    *,
+    prompt_text: str,
+    action_kind: str,
+    reply_to_message_id: int | None = None,
+) -> None:
+    prompt_message = await context.bot.send_message(
+        chat_id=runtime.config.chat_id,
+        text=prompt_text,
+        reply_to_message_id=reply_to_message_id,
+        disable_web_page_preview=True,
+    )
+    runtime.store.add_interactive_prompt(prompt_message.message_id, action_kind)
+    runtime.store.purge_old_rows(runtime.config.state_retention_days)
 
 
 async def safe_edit(
@@ -1734,6 +2015,8 @@ async def ai_reply_stream(
     state: EmailState,
     prompt: str,
 ) -> None:
+    if runtime.model is None:
+        return
     progress = await application.bot.send_message(
         chat_id=runtime.config.chat_id,
         text="⌛ AI…",
@@ -1755,11 +2038,32 @@ async def ai_reply_stream(
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    claimed = await claim_owner_if_needed(update, context)
+    if not claimed:
+        await deny_unauthorized(update)
+        return
+    runtime = get_runtime(context.application)
+    await send_setup_message(
+        update.effective_message,
+        runtime,
+        "Owner registrato. Da qui possiamo finire tutta la configurazione del bot.",
+    )
+
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    claimed = await claim_owner_if_needed(update, context)
+    if not claimed:
+        await deny_unauthorized(update)
+        return
+    runtime = get_runtime(context.application)
+    await send_setup_message(update.effective_message, runtime)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update, context):
         return
-    await update.effective_message.reply_text(
-        "Bot Gmail-AI pronto. Usa /config o /dashboard per aprire la dashboard."
-    )
+    runtime = get_runtime(context.application)
+    await send_setup_message(update.effective_message, runtime)
 
 
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1776,15 +2080,193 @@ async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def cmd_gmail_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update, context):
+        return
+    runtime = get_runtime(context.application)
+    try:
+        auth_url = start_google_oauth(runtime)
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Gmail login non pronto: {exc}")
+        return
+    await update.effective_message.reply_text(
+        "Apri questo link, fai login su Google e autorizza Gmail. Quando Google torna qui il token viene salvato automaticamente.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Connect Gmail", url=auth_url)]]),
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update, context):
+        return
+    runtime = get_runtime(context.application)
+    if len(context.args) < 2:
+        keys = ", ".join(sorted(BOT_CONFIG_ALIASES))
+        await update.effective_message.reply_text(
+            f"Uso: /set <chiave> <valore>\nChiavi supportate: {keys}"
+        )
+        return
+    raw_key = context.args[0]
+    raw_value = " ".join(context.args[1:]).strip()
+    try:
+        save_runtime_settings(runtime, {normalize_bot_config_key(raw_key): raw_value})
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Config non salvata: {exc}")
+        return
+    await send_setup_message(update.effective_message, runtime, f"Salvato {raw_key}.")
+
+
+async def cmd_unset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update, context):
+        return
+    runtime = get_runtime(context.application)
+    if not context.args:
+        await update.effective_message.reply_text("Uso: /unset <chiave>")
+        return
+    try:
+        key = normalize_bot_config_key(context.args[0])
+    except Exception as exc:
+        await update.effective_message.reply_text(str(exc))
+        return
+    runtime.store.delete_app_setting(key)
+    apply_runtime_overrides(runtime)
+    await send_setup_message(update.effective_message, runtime, f"Rimosso {context.args[0]}.")
+
+
+async def handle_setup_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime: Runtime,
+    action: str,
+) -> bool:
+    query = update.callback_query
+    if query is None or query.message is None:
+        return False
+    if action == "status":
+        await safe_edit(query.message, text=setup_message_text(runtime), markup=setup_keyboard(runtime))
+        await query.answer()
+        return True
+    if action == "dashboard":
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=runtime.config.chat_id,
+            text="Dashboard privata pronta.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Open dashboard", url=dashboard_url(runtime.config))]]
+            ),
+            disable_web_page_preview=True,
+        )
+        return True
+    if action == "google_api_key":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text="Rispondi a questo messaggio con la tua `GOOGLE_API_KEY`.",
+            action_kind="setup_google_api_key",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
+    if action == "public_base_url":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text="Rispondi con la `PUBLIC_BASE_URL` pubblica del bot, per esempio https://glassyreply-bot.fly.dev",
+            action_kind="setup_public_base_url",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
+    if action == "oauth_json":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text="Carica qui il file JSON del client OAuth Google di tipo Web, oppure incolla il JSON completo come testo.",
+            action_kind="setup_google_oauth_json",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
+    if action == "gmail_login":
+        try:
+            auth_url = start_google_oauth(runtime)
+        except Exception as exc:
+            await query.answer(f"Non pronto: {exc}", show_alert=True)
+            return True
+        await context.bot.send_message(
+            chat_id=runtime.config.chat_id,
+            text="Apri il link per collegare Gmail. Il token viene salvato al ritorno da Google.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Connect Gmail", url=auth_url)]]),
+            disable_web_page_preview=True,
+        )
+        await query.answer()
+        return True
+    return False
+
+
 async def txt_followup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update, context):
         return
 
     message = update.effective_message
-    if not message or not message.reply_to_message or not message.text:
+    if not message or not message.reply_to_message:
         return
 
     runtime = get_runtime(context.application)
+    interactive = runtime.store.pop_interactive_prompt(message.reply_to_message.message_id)
+    if interactive is not None:
+        raw_text = message.text.strip() if message.text else ""
+        document_bytes: bytes | None = None
+        if message.document:
+            telegram_file = await message.document.get_file()
+            document_bytes = bytes(await telegram_file.download_as_bytearray())
+        try:
+            if interactive.action_kind == "setup_google_api_key":
+                if not raw_text:
+                    raise ConfigError("Serve una Google API key testuale.")
+                save_runtime_settings(runtime, {"GOOGLE_API_KEY": raw_text})
+                await send_setup_message(message, runtime, "Google API key salvata.")
+                return
+            if interactive.action_kind == "setup_public_base_url":
+                if not raw_text:
+                    raise ConfigError("Serve una PUBLIC_BASE_URL testuale.")
+                save_runtime_settings(runtime, {"PUBLIC_BASE_URL": raw_text})
+                await send_setup_message(message, runtime, "Public base URL salvata.")
+                return
+            if interactive.action_kind == "setup_google_oauth_json":
+                if document_bytes is not None:
+                    raw_text = document_bytes.decode("utf-8")
+                if not raw_text:
+                    raise ConfigError("Serve un file JSON o il JSON incollato come testo.")
+                parsed = json.loads(raw_text)
+                if not isinstance(parsed, dict):
+                    raise ConfigError("Il JSON OAuth deve essere un oggetto.")
+                save_runtime_settings(
+                    runtime,
+                    {
+                        "GOOGLE_OAUTH_CREDENTIALS_JSON": json.dumps(
+                            parsed,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        )
+                    },
+                )
+                await send_setup_message(
+                    message,
+                    runtime,
+                    "Google OAuth client JSON salvato. Ora puoi usare /gmail_login o il bottone Connect Gmail.",
+                )
+                return
+            await message.reply_text("Prompt interattivo non riconosciuto.")
+            return
+        except Exception as exc:
+            runtime.store.add_interactive_prompt(message.reply_to_message.message_id, interactive.action_kind)
+            await message.reply_text(f"Config non salvata: {exc}")
+            return
+
+    if not message.text:
+        return
+
     pending = runtime.store.pop_pending_action(message.reply_to_message.message_id)
     if pending is None:
         return
@@ -1824,6 +2306,11 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     runtime = get_runtime(context.application)
     parts = query.data.split("|")
     action = parts[0]
+    if action == "setup":
+        handled = await handle_setup_callback(update, context, runtime, parts[1] if len(parts) > 1 else "")
+        if not handled:
+            await query.answer("Unsupported", show_alert=True)
+        return
     tg_message_id = int(parts[1])
     state = runtime.store.get_email_state(tg_message_id)
 
@@ -1962,6 +2449,8 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def process_new_email(application: Application, runtime: Runtime, gmail_message_id: str) -> None:
+    if not owner_configured(runtime.config):
+        return
     lang = runtime.config.lang
     payload = await asyncio.to_thread(runtime.gmail.get_full_message, gmail_message_id)
     message_payload = payload["payload"]
@@ -2004,12 +2493,15 @@ async def process_new_email(application: Application, runtime: Runtime, gmail_me
     runtime.store.upsert_email_state(state)
     runtime.store.purge_old_rows(runtime.config.state_retention_days)
     await safe_edit(tg_message, markup=kb_main(state.tg_message_id, state.starred, attachments))
-    await ai_reply_stream(application, runtime, state, DEFAULT_PROMPT)
+    if runtime.model is not None:
+        await ai_reply_stream(application, runtime, state, DEFAULT_PROMPT)
 
 
 async def watcher(runtime: Runtime, application: Application) -> None:
+    if not gmail_ready_for_watch(runtime.config):
+        LOGGER.info("Watcher waiting for owner/Gmail setup.")
     last_seen = runtime.store.get_bot_state(LAST_SEEN_KEY)
-    if not last_seen:
+    if not last_seen and gmail_ready_for_watch(runtime.config):
         try:
             last_seen = await asyncio.to_thread(runtime.gmail.latest_inbox_id)
             if last_seen:
@@ -2019,6 +2511,13 @@ async def watcher(runtime: Runtime, application: Application) -> None:
             last_seen = None
 
     while not runtime.shutdown_event.is_set():
+        if not gmail_ready_for_watch(runtime.config):
+            try:
+                interval = max(1, int(runtime.config.watch_interval))
+                await asyncio.wait_for(runtime.shutdown_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+            continue
         try:
             newest = await asyncio.to_thread(runtime.gmail.latest_inbox_id)
             if newest and newest != last_seen:
@@ -2041,6 +2540,8 @@ async def on_err(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         runtime = get_runtime(context.application)
     except Exception:
+        return
+    if not owner_configured(runtime.config):
         return
     try:
         await context.bot.send_message(runtime.config.chat_id, f"⚠️ Errore: {context.error}")
@@ -2074,8 +2575,8 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
         authorized, token = await require_dashboard_auth()
         if not authorized:
             return (
-                "<h1>Unauthorized</h1><p>Use the Telegram command <code>/config</code> to "
-                "open a signed dashboard link.</p>",
+                "<h1>Unauthorized</h1><p>Use the Telegram command <code>/setup</code> or "
+                "<code>/config</code> to open a private control link.</p>",
                 401,
             )
         return dashboard_page(runtime, title="GlassyReply dashboard", token=token or "")
@@ -2087,8 +2588,8 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
         token = dashboard_token_from_request() or form_data.get("token")
         if not verify_dashboard_token(runtime.config, token):
             return (
-                "<h1>Unauthorized</h1><p>Use the Telegram command <code>/config</code> to "
-                "open a signed dashboard link.</p>",
+                "<h1>Unauthorized</h1><p>Use the Telegram command <code>/setup</code> or "
+                "<code>/config</code> to open a private control link.</p>",
                 401,
             )
         current_overrides = runtime.store.get_app_settings()
@@ -2122,6 +2623,47 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
             token=token or "",
             message="Configuration saved.",
         )
+
+    @app.get("/oauth/google/callback")
+    async def google_oauth_callback():
+        state_payload_raw = runtime.store.get_bot_state(GOOGLE_OAUTH_STATE_KEY)
+        if not state_payload_raw:
+            return "<h1>OAuth state missing</h1><p>Restart the Gmail login from Telegram.</p>", 400
+        try:
+            state_payload = json.loads(state_payload_raw)
+            expected_state = state_payload["state"]
+        except Exception:
+            return "<h1>OAuth state invalid</h1><p>Restart the Gmail login from Telegram.</p>", 400
+        if request.args.get("state") != expected_state:
+            return "<h1>OAuth state mismatch</h1><p>Restart the Gmail login from Telegram.</p>", 400
+        try:
+            client_config = google_web_client_config(runtime.config)
+            flow = Flow.from_client_config(
+                client_config,
+                scopes=SCOPES,
+                state=expected_state,
+                redirect_uri=google_oauth_redirect_url(runtime.config),
+            )
+            flow.fetch_token(authorization_response=request.url)
+            save_runtime_settings(runtime, {"GOOGLE_OAUTH_TOKEN_JSON": flow.credentials.to_json()})
+            clear_google_oauth_state(runtime)
+            if owner_configured(runtime.config):
+                await application.bot.send_message(
+                    chat_id=runtime.config.chat_id,
+                    text="Gmail collegato con successo. Il token OAuth e' stato salvato.",
+                    reply_markup=setup_keyboard(runtime),
+                    disable_web_page_preview=True,
+                )
+            return (
+                "<h1>Gmail connected</h1><p>You can close this page and go back to Telegram.</p>",
+                200,
+            )
+        except Exception as exc:
+            LOGGER.exception("Google OAuth callback failed.")
+            return (
+                f"<h1>OAuth error</h1><p>{ihtml.escape(str(exc))}</p>",
+                500,
+            )
 
     @app.post("/pixel_status")
     async def pixel_status():
@@ -2229,10 +2771,17 @@ def build_application(runtime: Runtime) -> Application:
     )
     application.bot_data["runtime"] = runtime
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("setup", cmd_setup))
+    application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("config", cmd_dashboard))
     application.add_handler(CommandHandler("dashboard", cmd_dashboard))
+    application.add_handler(CommandHandler("gmail_login", cmd_gmail_login))
+    application.add_handler(CommandHandler("set", cmd_set))
+    application.add_handler(CommandHandler("unset", cmd_unset))
     application.add_handler(CallbackQueryHandler(cb_btn))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, txt_followup))
+    application.add_handler(
+        MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.Document.ALL, txt_followup)
+    )
     application.add_error_handler(on_err)
     return application
 
@@ -2296,14 +2845,18 @@ async def run(args: argparse.Namespace) -> None:
     config.materialize_gmail_token()
     store.purge_old_rows(config.state_retention_days)
 
-    genai.configure(api_key=config.google_api_key)
+    model: Any = None
+    if config.google_api_key:
+        genai.configure(api_key=config.google_api_key)
+        model = genai.GenerativeModel(config.ai_model)
+
     runtime = Runtime(
         base_config=base_config,
         config=config,
         startup_overrides=startup_overrides,
         store=store,
         gmail=GmailClient(config),
-        model=genai.GenerativeModel(config.ai_model),
+        model=model,
         shutdown_event=asyncio.Event(),
         mode=args.mode,
     )
@@ -2315,10 +2868,11 @@ async def run(args: argparse.Namespace) -> None:
     watcher_task: asyncio.Task[Any] | None = None
     stop_task: asyncio.Task[Any] | None = None
 
-    try:
-        await asyncio.to_thread(runtime.gmail.refresh_labels, True)
-    except Exception:
-        LOGGER.exception("Initial Gmail label load failed.")
+    if gmail_ready_for_watch(runtime.config):
+        try:
+            await asyncio.to_thread(runtime.gmail.refresh_labels, True)
+        except Exception:
+            LOGGER.exception("Initial Gmail label load failed.")
 
     try:
         await bootstrap_telegram(application, runtime, args.mode)
