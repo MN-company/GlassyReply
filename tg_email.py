@@ -1151,11 +1151,10 @@ def google_web_client_config(config: Config) -> dict:
         raise ConfigError(
             "Bot-based Gmail login needs a Google OAuth Web application JSON under the 'web' key."
         )
-    redirect_uri = google_oauth_redirect_url(config)
-    redirect_uris = web_config.get("redirect_uris") or []
-    if redirect_uri not in redirect_uris:
+    missing = [key for key in ("client_id", "client_secret", "auth_uri", "token_uri") if not web_config.get(key)]
+    if missing:
         raise ConfigError(
-            f"Add {redirect_uri} to the Google OAuth redirect URIs before connecting Gmail."
+            "Google OAuth Web client JSON is missing required fields: " + ", ".join(missing)
         )
     return client_config
 
@@ -1195,6 +1194,7 @@ def setup_keyboard(runtime: Runtime) -> InlineKeyboardMarkup:
 
 
 def setup_message_text(runtime: Runtime) -> str:
+    redirect_uri = google_oauth_redirect_url(runtime.config)
     lines = ["Self-hosted setup status:", ""] + [f"- {line}" for line in setup_status_lines(runtime)]
     lines.extend(
         [
@@ -1204,7 +1204,8 @@ def setup_message_text(runtime: Runtime) -> str:
             "2. Set the Gemini key.",
             "3. Set the public base URL of this app.",
             "4. Upload the Google OAuth Web client JSON.",
-            "5. Tap Connect Gmail and finish the Google login in the browser.",
+            f"5. In Google Cloud Console, add this redirect URI: {redirect_uri}",
+            "6. Tap Connect Gmail and finish the Google login in the browser.",
         ]
     )
     return "\n".join(lines)

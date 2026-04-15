@@ -178,11 +178,43 @@ class SelfHostedSetupTests(unittest.TestCase):
                 save_runtime_settings(
                     runtime,
                     {
-                        "GOOGLE_OAUTH_CREDENTIALS_JSON": '{"web":{"client_id":"x","project_id":"p","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","client_secret":"secret","redirect_uris":["http://127.0.0.1:8080/oauth/google/callback"]}}'
+                        "GOOGLE_OAUTH_CREDENTIALS_JSON": '{"web":{"client_id":"x","project_id":"p","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","client_secret":"secret"}}'
                     },
                 )
                 loaded = google_web_client_config(runtime.config)
                 self.assertIn("web", loaded)
+            finally:
+                runtime.store.close()
+
+    def test_google_web_client_config_does_not_require_redirect_uri_in_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = Config.from_env(
+                {
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "PUBLIC_BASE_URL": "https://example.com",
+                    "DATA_DIR": tmpdir,
+                }
+            )
+            store = StateStore(Path(tmpdir) / "state.db")
+            runtime = Runtime(
+                base_config=cfg,
+                config=cfg,
+                startup_overrides={},
+                store=store,
+                gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+                model=None,
+                shutdown_event=SimpleNamespace(),
+                mode="polling",
+            )
+            try:
+                save_runtime_settings(
+                    runtime,
+                    {
+                        "GOOGLE_OAUTH_CREDENTIALS_JSON": '{"web":{"client_id":"x","project_id":"p","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","client_secret":"secret"}}'
+                    },
+                )
+                loaded = google_web_client_config(runtime.config)
+                self.assertEqual(loaded["web"]["client_id"], "x")
             finally:
                 runtime.store.close()
 
