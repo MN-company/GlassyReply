@@ -757,14 +757,38 @@ class GmailClient:
         raise RuntimeError("gmail_call failed without HttpError")
 
     def latest_inbox_id(self) -> str | None:
-        payload = self.call(
-            lambda svc: svc.users()
-            .messages()
-            .list(userId="me", labelIds=["INBOX"], maxResults=1, includeSpamTrash=False)
-            .execute()
-        )
-        messages = payload.get("messages") or []
-        return messages[0]["id"] if messages else None
+        message_ids = self.list_recent_inbox_ids(limit=1)
+        return message_ids[0] if message_ids else None
+
+    def list_recent_inbox_ids(self, limit: int = 100) -> List[str]:
+        def fetch(service: Any) -> List[str]:
+            message_ids: List[str] = []
+            page_token: str | None = None
+            while len(message_ids) < limit:
+                payload = (
+                    service.users()
+                    .messages()
+                    .list(
+                        userId="me",
+                        labelIds=["INBOX"],
+                        maxResults=min(100, limit - len(message_ids)),
+                        includeSpamTrash=False,
+                        pageToken=page_token,
+                    )
+                    .execute()
+                )
+                for item in payload.get("messages") or []:
+                    message_id = item.get("id")
+                    if message_id:
+                        message_ids.append(message_id)
+                        if len(message_ids) >= limit:
+                            break
+                page_token = payload.get("nextPageToken")
+                if not page_token or not payload.get("messages"):
+                    break
+            return message_ids
+
+        return self.call(fetch)
 
     def get_full_message(self, gmail_message_id: str) -> dict:
         return self.call(
@@ -1186,6 +1210,35 @@ def setup_message_text(runtime: Runtime) -> str:
     return "\n".join(lines)
 
 
+def startup_notice_text(runtime: Runtime, gmail_error: str | None = None) -> str | None:
+    if not owner_configured(runtime.config):
+        return None
+
+    missing: List[str] = []
+    if not ai_configured(runtime.config):
+        missing.append("Gemini API key missing")
+    if not google_credentials_available(runtime.config):
+        missing.append("Google OAuth client JSON missing")
+    if not google_token_available(runtime.config):
+        missing.append("Gmail token missing")
+    if gmail_error:
+        missing.append(f"Gmail auth failed at startup: {gmail_error}")
+
+    if not missing:
+        return None
+
+    return "\n".join(
+        [
+            "GlassyReply is running, but setup is still incomplete.",
+            "",
+            "Missing pieces:",
+            *[f"- {item}" for item in missing],
+            "",
+            "Open /setup to finish the configuration, /gmail_login to reconnect Gmail, or /dashboard to inspect saved values.",
+        ]
+    )
+
+
 def save_runtime_settings(runtime: Runtime, updates: Mapping[str, str]) -> None:
     current = runtime.store.get_app_settings()
     merged = dict(current)
@@ -1282,6 +1335,21 @@ def build_tracking_markup(config: Config, state: EmailState) -> str:
         f"@font-face {{ font-family:'grtrack-{nonce}'; src:url('{font_url}') format('woff2'); font-style:normal; font-weight:400; }}"
         "</style>"
     )
+
+
+def split_unseen_inbox_ids(recent_ids: List[str], last_seen: str | None) -> tuple[List[str], str | None]:
+    if not recent_ids:
+        return [], last_seen
+    newest_seen = recent_ids[0]
+    if not last_seen:
+        return [], newest_seen
+    try:
+        index = recent_ids.index(last_seen)
+    except ValueError:
+        return [], newest_seen
+    if index <= 0:
+        return [], newest_seen
+    return list(reversed(recent_ids[:index])), newest_seen
 
 
 EDITABLE_DASHBOARD_FIELDS = [
@@ -2503,8 +2571,9 @@ async def watcher(runtime: Runtime, application: Application) -> None:
     last_seen = runtime.store.get_bot_state(LAST_SEEN_KEY)
     if not last_seen and gmail_ready_for_watch(runtime.config):
         try:
-            last_seen = await asyncio.to_thread(runtime.gmail.latest_inbox_id)
-            if last_seen:
+            recent_ids = await asyncio.to_thread(runtime.gmail.list_recent_inbox_ids, 1)
+            if recent_ids:
+                last_seen = recent_ids[0]
                 runtime.store.set_bot_state(LAST_SEEN_KEY, last_seen)
         except Exception:
             LOGGER.exception("Initial Gmail watcher bootstrap failed.")
@@ -2519,11 +2588,18 @@ async def watcher(runtime: Runtime, application: Application) -> None:
                 continue
             continue
         try:
-            newest = await asyncio.to_thread(runtime.gmail.latest_inbox_id)
-            if newest and newest != last_seen:
-                last_seen = newest
-                runtime.store.set_bot_state(LAST_SEEN_KEY, newest)
-                await process_new_email(application, runtime, newest)
+            recent_ids = await asyncio.to_thread(runtime.gmail.list_recent_inbox_ids)
+            if recent_ids:
+                unseen_ids, newest_seen = split_unseen_inbox_ids(recent_ids, last_seen)
+                if unseen_ids:
+                    for gmail_message_id in unseen_ids:
+                        await process_new_email(application, runtime, gmail_message_id)
+                    last_seen = newest_seen
+                    if newest_seen:
+                        runtime.store.set_bot_state(LAST_SEEN_KEY, newest_seen)
+                elif newest_seen and newest_seen != last_seen:
+                    last_seen = newest_seen
+                    runtime.store.set_bot_state(LAST_SEEN_KEY, newest_seen)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2871,11 +2947,25 @@ async def run(args: argparse.Namespace) -> None:
     if gmail_ready_for_watch(runtime.config):
         try:
             await asyncio.to_thread(runtime.gmail.refresh_labels, True)
-        except Exception:
+            gmail_bootstrap_error = None
+        except Exception as exc:
             LOGGER.exception("Initial Gmail label load failed.")
+            gmail_bootstrap_error = str(exc)
+    else:
+        gmail_bootstrap_error = None
 
     try:
         await bootstrap_telegram(application, runtime, args.mode)
+        startup_notice = startup_notice_text(runtime, gmail_bootstrap_error)
+        if startup_notice:
+            try:
+                await application.bot.send_message(
+                    chat_id=runtime.config.chat_id,
+                    text=startup_notice,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                LOGGER.exception("Failed to deliver startup notice to Telegram.")
         http_task = asyncio.create_task(run_http_server(runtime, web_app))
         watcher_task = asyncio.create_task(watcher(runtime, application))
         stop_task = asyncio.create_task(runtime.shutdown_event.wait())

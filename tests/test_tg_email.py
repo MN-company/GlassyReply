@@ -24,6 +24,8 @@ from tg_email import (
     owner_configured,
     is_authorized_update,
     save_runtime_settings,
+    split_unseen_inbox_ids,
+    startup_notice_text,
     verify_dashboard_token,
 )
 
@@ -184,6 +186,36 @@ class SelfHostedSetupTests(unittest.TestCase):
             finally:
                 runtime.store.close()
 
+    def test_startup_notice_text_reports_missing_setup(self) -> None:
+        cfg = Config.from_env(
+            {
+                "TELEGRAM_BOT_TOKEN": "token",
+                "TELEGRAM_CHAT_ID": "123",
+                "DATA_DIR": tempfile.mkdtemp(),
+            }
+        )
+        store = StateStore(Path(cfg.data_dir) / "state.db")
+        runtime = Runtime(
+            base_config=cfg,
+            config=cfg,
+            startup_overrides={},
+            store=store,
+            gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+            model=None,
+            shutdown_event=SimpleNamespace(),
+            mode="polling",
+        )
+        try:
+            notice = startup_notice_text(runtime, gmail_error="Gmail auth failed at startup")
+            self.assertIsNotNone(notice)
+            self.assertIn("setup is still incomplete", notice)
+            self.assertIn("Gmail auth failed at startup", notice)
+        finally:
+            store.close()
+            import shutil
+
+            shutil.rmtree(cfg.data_dir, ignore_errors=True)
+
 
 class AuthGuardTests(unittest.TestCase):
     def test_authorized_user_matches_chat_id(self) -> None:
@@ -249,6 +281,18 @@ class DashboardConfigTests(unittest.TestCase):
                     build_candidate_config(runtime, {"ENABLE_PIXEL": "1"})
             finally:
                 runtime.store.close()
+
+
+class GmailWatchHelpersTests(unittest.TestCase):
+    def test_split_unseen_inbox_ids_returns_chronological_new_messages(self) -> None:
+        unseen, newest = split_unseen_inbox_ids(["m5", "m4", "m3", "m2"], "m3")
+        self.assertEqual(unseen, ["m4", "m5"])
+        self.assertEqual(newest, "m5")
+
+    def test_split_unseen_inbox_ids_handles_missing_last_seen(self) -> None:
+        unseen, newest = split_unseen_inbox_ids(["m5", "m4"], None)
+        self.assertEqual(unseen, [])
+        self.assertEqual(newest, "m5")
 
 
 class WebAppSmokeTests(unittest.TestCase):
