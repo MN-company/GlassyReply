@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import tempfile
 import unittest
@@ -34,6 +35,7 @@ from tg_email import (
     is_authorized_update,
     google_oauth_authorization_response,
     parse_google_oauth_state_payload,
+    payload_text,
     save_runtime_settings,
     split_unseen_inbox_ids,
     start_google_oauth,
@@ -109,6 +111,13 @@ class ConfigTests(unittest.TestCase):
 
         overridden = cfg.with_overrides({"SYSTEM_PROMPT": "Prompt custom"})
         self.assertEqual(overridden.system_prompt, "Prompt custom")
+
+    def test_gmail_monitor_labels_override(self) -> None:
+        cfg = Config.from_env({"TELEGRAM_BOT_TOKEN": "token"})
+        overridden = cfg.with_overrides(
+            {"GMAIL_MONITOR_LABELS": json.dumps(["INBOX", "CATEGORY_PROMOTIONS"])}
+        )
+        self.assertEqual(overridden.gmail_monitor_labels, ["INBOX", "CATEGORY_PROMOTIONS"])
 
 
 class StateStoreTests(unittest.TestCase):
@@ -494,6 +503,34 @@ class GmailWatchHelpersTests(unittest.TestCase):
         self.assertEqual(newest, "m5")
 
 
+class EmailRenderingTests(unittest.TestCase):
+    def test_payload_text_prefers_clean_html_when_plain_missing(self) -> None:
+        html = """
+        <html>
+          <head><style>.hero { display:none; }</style></head>
+          <body>
+            <div>Hi Paolo,</div>
+            <p>check the update below</p>
+            <img src="cid:test" alt="promo banner">
+            <script>alert('x')</script>
+            <div>Thanks</div>
+          </body>
+        </html>
+        """
+        payload = {
+            "mimeType": "text/html",
+            "body": {"data": base64.urlsafe_b64encode(html.encode()).decode()},
+            "parts": [],
+        }
+
+        rendered = payload_text(payload)
+
+        self.assertIn("Hi Paolo,", rendered)
+        self.assertIn("check the update below", rendered)
+        self.assertIn("[immagine: promo banner]", rendered)
+        self.assertNotIn("alert", rendered)
+
+
 class WebAppSmokeTests(unittest.TestCase):
     def test_root_and_dashboard_auth(self) -> None:
         async def run() -> None:
@@ -795,6 +832,28 @@ class GmailClientTests(unittest.TestCase):
             client.call(lambda svc: svc.run())
 
         self.assertEqual(services, [])
+
+    def test_list_recent_monitored_ids_merges_multiple_labels(self) -> None:
+        cfg = Config.from_env({"TELEGRAM_BOT_TOKEN": "token"})
+        client = GmailClient(cfg, service_factory=lambda: SimpleNamespace())
+        label_payloads = {
+            "INBOX": ["m3", "m1"],
+            "CATEGORY_PROMOTIONS": ["m2", "m1"],
+        }
+        internal_dates = {"m1": 10, "m2": 20, "m3": 30}
+
+        with patch.object(
+            client,
+            "list_recent_label_ids",
+            side_effect=lambda label_id, limit=100: label_payloads[label_id],
+        ), patch.object(
+            client,
+            "get_internal_date",
+            side_effect=lambda message_id: internal_dates[message_id],
+        ):
+            merged = client.list_recent_monitored_ids(["INBOX", "CATEGORY_PROMOTIONS"], limit=10)
+
+        self.assertEqual(merged, ["m3", "m2", "m1"])
 
 
 if __name__ == "__main__":

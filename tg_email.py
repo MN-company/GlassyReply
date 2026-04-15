@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header
 from email.utils import parseaddr
+from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
@@ -74,6 +75,16 @@ TRACKED_DRAFT_SUBJECT_KEY = "tracked_draft_subject"
 MENU_TRACKED_EMAIL = "Email Tracciata"
 MENU_STATS = "Stats"
 MENU_SETTINGS = "Impostazioni"
+GMAIL_MONITOR_LABEL_CHOICES = [
+    ("INBOX", "Inbox"),
+    ("CATEGORY_PERSONAL", "Primaria"),
+    ("CATEGORY_PROMOTIONS", "Promozioni"),
+    ("CATEGORY_SOCIAL", "Social"),
+    ("CATEGORY_UPDATES", "Aggiornamenti"),
+    ("CATEGORY_FORUMS", "Forum"),
+    ("IMPORTANT", "Importanti"),
+    ("STARRED", "Speciali"),
+]
 
 
 class ConfigError(RuntimeError):
@@ -142,6 +153,7 @@ class Config:
     lang: str
     ai_model: str
     system_prompt: str
+    gmail_monitor_labels: List[str]
     predef_fwd: List[str]
     state_retention_days: int
     telegram_webhook_url: str
@@ -187,6 +199,7 @@ class Config:
         lang = source.get("LANG", "it").strip() or "it"
         ai_model = source.get("AI_MODEL", AI_MODEL).strip() or AI_MODEL
         system_prompt = source.get("SYSTEM_PROMPT", DEFAULT_PROMPT).strip() or DEFAULT_PROMPT
+        gmail_monitor_labels = parse_list(source.get("GMAIL_MONITOR_LABELS"), ["INBOX"])
         predef_fwd = parse_list(source.get("PREDEF_FWD"), PREDEF_FWD)
         state_retention_days_raw = source.get("STATE_RETENTION_DAYS", str(STATE_RETENTION_DAYS)).strip()
         telegram_webhook_url = source.get("TELEGRAM_WEBHOOK_URL", "").strip()
@@ -232,6 +245,7 @@ class Config:
             lang=lang,
             ai_model=ai_model,
             system_prompt=system_prompt,
+            gmail_monitor_labels=gmail_monitor_labels or ["INBOX"],
             predef_fwd=predef_fwd,
             state_retention_days=state_retention_days,
             telegram_webhook_url=telegram_webhook_url,
@@ -276,6 +290,8 @@ class Config:
             raise ConfigError("WATCH_INTERVAL must be > 0")
         if self.state_retention_days <= 0:
             raise ConfigError("STATE_RETENTION_DAYS must be > 0")
+        if not self.gmail_monitor_labels:
+            raise ConfigError("GMAIL_MONITOR_LABELS must contain at least one label")
         if self.enable_pixel and not self.pixel_base_url:
             raise ConfigError("ENABLE_PIXEL=true requires PIXEL_BASE_URL")
         if self.enable_pixel and not self.pixel_webhook_secret:
@@ -311,6 +327,7 @@ class Config:
             "lang": self.lang,
             "ai_model": self.ai_model,
             "system_prompt": self.system_prompt,
+            "gmail_monitor_labels": list(self.gmail_monitor_labels),
             "predef_fwd": list(self.predef_fwd),
             "state_retention_days": self.state_retention_days,
             "public_base_url": self.public_base_url,
@@ -350,6 +367,10 @@ class Config:
             data["ai_model"] = overrides["AI_MODEL"].strip() or data["ai_model"]
         if "SYSTEM_PROMPT" in overrides:
             data["system_prompt"] = overrides["SYSTEM_PROMPT"].strip() or data["system_prompt"]
+        if "GMAIL_MONITOR_LABELS" in overrides:
+            data["gmail_monitor_labels"] = parse_list(
+                overrides["GMAIL_MONITOR_LABELS"], data["gmail_monitor_labels"]
+            ) or ["INBOX"]
         if "PREDEF_FWD" in overrides:
             data["predef_fwd"] = parse_list(overrides["PREDEF_FWD"], data["predef_fwd"])
         if "STATE_RETENTION_DAYS" in overrides:
@@ -956,10 +977,10 @@ class GmailClient:
         raise RuntimeError("gmail_call failed without HttpError")
 
     def latest_inbox_id(self) -> str | None:
-        message_ids = self.list_recent_inbox_ids(limit=1)
+        message_ids = self.list_recent_monitored_ids(self.config.gmail_monitor_labels, limit=1)
         return message_ids[0] if message_ids else None
 
-    def list_recent_inbox_ids(self, limit: int = 100) -> List[str]:
+    def list_recent_label_ids(self, label_id: str, limit: int = 100) -> List[str]:
         def fetch(service: Any) -> List[str]:
             message_ids: List[str] = []
             page_token: str | None = None
@@ -969,7 +990,7 @@ class GmailClient:
                     .messages()
                     .list(
                         userId="me",
-                        labelIds=["INBOX"],
+                        labelIds=[label_id],
                         maxResults=min(100, limit - len(message_ids)),
                         includeSpamTrash=False,
                         pageToken=page_token,
@@ -988,6 +1009,38 @@ class GmailClient:
             return message_ids
 
         return self.call(fetch)
+
+    def get_internal_date(self, gmail_message_id: str) -> int:
+        payload = self.call(
+            lambda svc: svc.users()
+            .messages()
+            .get(userId="me", id=gmail_message_id, format="minimal")
+            .execute()
+        )
+        try:
+            return int(payload.get("internalDate", "0"))
+        except (TypeError, ValueError):
+            return 0
+
+    def list_recent_monitored_ids(self, label_ids: List[str], limit: int = 100) -> List[str]:
+        labels = [label for label in label_ids if label] or ["INBOX"]
+        if len(labels) == 1:
+            return self.list_recent_label_ids(labels[0], limit=limit)
+
+        per_label_limit = max(10, min(limit, 30))
+        seen: set[str] = set()
+        candidates: List[str] = []
+        for label_id in labels:
+            for message_id in self.list_recent_label_ids(label_id, limit=per_label_limit):
+                if message_id not in seen:
+                    seen.add(message_id)
+                    candidates.append(message_id)
+        ranked = sorted(
+            candidates,
+            key=self.get_internal_date,
+            reverse=True,
+        )
+        return ranked[:limit]
 
     def get_full_message(self, gmail_message_id: str) -> dict:
         return self.call(
@@ -1094,6 +1147,128 @@ def decode_base64_body(data: str | None) -> str | None:
         return None
 
 
+class EmailHTMLTextExtractor(HTMLParser):
+    BLOCK_TAGS = {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "div",
+        "figcaption",
+        "figure",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "li",
+        "main",
+        "nav",
+        "p",
+        "section",
+        "table",
+        "tr",
+        "td",
+        "th",
+        "ul",
+        "ol",
+    }
+    SKIP_TAGS = {"head", "meta", "script", "style", "svg", "title", "noscript"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: List[str] = []
+        self._skip_depth = 0
+
+    def _append_break(self) -> None:
+        if not self.parts:
+            return
+        if self.parts[-1].endswith("\n"):
+            return
+        self.parts.append("\n")
+
+    def handle_starttag(self, tag: str, attrs: List[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if tag == "br":
+            self._append_break()
+            return
+        if tag in self.BLOCK_TAGS:
+            self._append_break()
+            if tag == "li":
+                self.parts.append("• ")
+            return
+        if tag == "img":
+            attributes = dict(attrs)
+            alt = (attributes.get("alt") or "").strip()
+            if alt and len(alt) <= 80:
+                self.parts.append(f"[immagine: {alt}]")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self.SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if self._skip_depth:
+            return
+        if tag in self.BLOCK_TAGS:
+            self._append_break()
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        cleaned = re.sub(r"\s+", " ", data.replace("\xa0", " ")).strip()
+        if not cleaned:
+            return
+        self.parts.append(cleaned)
+
+    def get_text(self) -> str:
+        text = "".join(self.parts)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+def normalize_email_text(text: str) -> str:
+    cleaned = text.replace("\r", "").replace("\xa0", " ")
+    cleaned = re.sub(r"[\u200b-\u200d\ufeff]", "", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in cleaned.splitlines()]
+    normalized: List[str] = []
+    blank_run = 0
+    for line in lines:
+        if not line:
+            blank_run += 1
+            if blank_run <= 1:
+                normalized.append("")
+            continue
+        blank_run = 0
+        normalized.append(line)
+    return "\n".join(normalized).strip()
+
+
+def html_to_text(html: str) -> str:
+    parser = EmailHTMLTextExtractor()
+    parser.feed(html)
+    parser.close()
+    return normalize_email_text(parser.get_text())
+
+
+def is_useful_email_text(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 20:
+        return False
+    alpha_count = sum(char.isalpha() for char in compact)
+    return alpha_count >= min(20, len(compact) // 4)
+
+
 def payload_text(payload: dict) -> str:
     plain: str | None = None
     html: str | None = None
@@ -1112,12 +1287,15 @@ def payload_text(payload: dict) -> str:
 
     visit(payload)
 
-    if plain:
-        return plain.strip()
+    normalized_plain = normalize_email_text(plain) if plain else ""
+    if normalized_plain and is_useful_email_text(normalized_plain):
+        return normalized_plain
     if html:
-        cleaned = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
-        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
-        return ihtml.unescape(cleaned).strip()
+        normalized_html = html_to_text(html)
+        if normalized_html:
+            return normalized_html
+    if normalized_plain:
+        return normalized_plain
     return "(corpo non disponibile)"
 
 
@@ -1201,12 +1379,14 @@ def format_email_text(
 def settings_message_text(runtime: Runtime) -> str:
     prompt_preview = ihtml.escape(shorten_text(runtime.config.system_prompt, limit=160))
     public_base_url = ihtml.escape(runtime.config.resolved_public_base_url() or "missing")
+    monitor_labels = ihtml.escape(", ".join(runtime.config.gmail_monitor_labels))
     lines = [
         "Impostazioni rapide:",
         "",
         f"- Gemini key: {'set' if ai_configured(runtime.config) else 'missing'}",
         f"- Gmail OAuth: {'set' if google_credentials_available(runtime.config) else 'missing'}",
         f"- Gmail token: {'set' if google_token_available(runtime.config) else 'missing'}",
+        f"- Cartelle Gmail: {monitor_labels}",
         f"- Pixel: {'enabled' if runtime.config.enable_pixel else 'disabled'}",
         f"- Public URL: {public_base_url}",
         "",
@@ -1456,6 +1636,7 @@ def setup_status_lines(runtime: Runtime) -> List[str]:
         f"Public base URL: {config.resolved_public_base_url() or 'missing'}",
         f"Google OAuth client JSON: {'set' if google_credentials_available(config) else 'missing'}",
         f"Gmail refresh token: {'set' if google_token_available(config) else 'missing'}",
+        f"Gmail monitor labels: {', '.join(config.gmail_monitor_labels)}",
         f"Pixel tracking: {'enabled' if config.enable_pixel else 'disabled'}",
     ]
 
@@ -1488,6 +1669,10 @@ def settings_keyboard(runtime: Runtime) -> InlineKeyboardMarkup:
             InlineKeyboardButton("Public URL", callback_data="settings|public_base_url"),
         ],
         [
+            InlineKeyboardButton("Cartelle Gmail", callback_data="settings|monitor_labels"),
+            InlineKeyboardButton("OAuth JSON", callback_data="settings|oauth_json"),
+        ],
+        [
             InlineKeyboardButton("Pixel URL", callback_data="settings|pixel_base_url"),
             InlineKeyboardButton("Pixel secret", callback_data="settings|pixel_webhook_secret"),
         ],
@@ -1496,12 +1681,32 @@ def settings_keyboard(runtime: Runtime) -> InlineKeyboardMarkup:
                 "Pixel ON/OFF",
                 callback_data="settings|toggle_pixel",
             ),
-            InlineKeyboardButton("OAuth JSON", callback_data="settings|oauth_json"),
+            InlineKeyboardButton("Open dashboard", callback_data="settings|dashboard"),
         ],
     ]
     if google_credentials_available(runtime.config):
         rows.append([InlineKeyboardButton("Connect Gmail", callback_data="settings|gmail_login")])
-    rows.append([InlineKeyboardButton("Open dashboard", callback_data="settings|dashboard")])
+    return InlineKeyboardMarkup(rows)
+
+
+def gmail_monitor_keyboard(runtime: Runtime) -> InlineKeyboardMarkup:
+    selected = set(runtime.config.gmail_monitor_labels)
+    rows: List[List[InlineKeyboardButton]] = []
+    current_row: List[InlineKeyboardButton] = []
+    for label_id, label_name in GMAIL_MONITOR_LABEL_CHOICES:
+        prefix = "✅ " if label_id in selected else ""
+        current_row.append(
+            InlineKeyboardButton(
+                prefix + label_name,
+                callback_data=f"settings|toggle_label|{label_id}",
+            )
+        )
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+    rows.append([InlineKeyboardButton("⬅️ Torna", callback_data="settings|status")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1573,6 +1778,8 @@ def save_runtime_settings(runtime: Runtime, updates: Mapping[str, str]) -> None:
     for key, value in updates.items():
         runtime.store.set_app_setting(key, value)
     apply_runtime_overrides(runtime)
+    if "GMAIL_MONITOR_LABELS" in updates:
+        mark_gmail_initial_sync_pending(runtime)
 
 
 def claim_owner(runtime: Runtime, user_id: int) -> None:
@@ -1642,6 +1849,7 @@ BOT_CONFIG_ALIASES = {
     "lang": "LANG",
     "ai_model": "AI_MODEL",
     "system_prompt": "SYSTEM_PROMPT",
+    "gmail_monitor_labels": "GMAIL_MONITOR_LABELS",
     "predef_fwd": "PREDEF_FWD",
     "state_retention_days": "STATE_RETENTION_DAYS",
     "telegram_webhook_url": "TELEGRAM_WEBHOOK_URL",
@@ -1790,6 +1998,13 @@ EDITABLE_DASHBOARD_FIELDS = [
         help_text="Default instruction used for automatic AI drafts.",
     ),
     DashboardField(
+        key="GMAIL_MONITOR_LABELS",
+        attr="gmail_monitor_labels",
+        label="Gmail monitor labels",
+        kind="textarea",
+        help_text="One Gmail label per line. Example: INBOX, CATEGORY_PROMOTIONS, CATEGORY_UPDATES.",
+    ),
+    DashboardField(
         key="PREDEF_FWD",
         attr="predef_fwd",
         label="Preset forward addresses",
@@ -1842,7 +2057,7 @@ def field_display_value(field: DashboardField, value: Any) -> str:
         return "enabled" if bool(value) else "disabled"
     if field.secret:
         return "set" if value else "missing"
-    if field.key == "PREDEF_FWD":
+    if field.key in {"PREDEF_FWD", "GMAIL_MONITOR_LABELS"}:
         if isinstance(value, list):
             if not value:
                 return "unset"
@@ -2260,10 +2475,13 @@ def kb_main(tg_message_id: int, starred: bool, attachments: List[dict]) -> Inlin
             InlineKeyboardButton("💾 Bozza", callback_data=f"draft|{tg_message_id}"),
         ],
         [
-            InlineKeyboardButton("✏️ Riscrivi", callback_data=f"ask|{tg_message_id}"),
-            InlineKeyboardButton("❌ Rifiuta", callback_data=f"reject|{tg_message_id}"),
+            InlineKeyboardButton("🤖 Analizza AI", callback_data=f"analyze|{tg_message_id}"),
+            InlineKeyboardButton("✏️ Prompt AI", callback_data=f"ask|{tg_message_id}"),
         ],
-        [InlineKeyboardButton("🗑️ Cestino", callback_data=f"trash|{tg_message_id}")],
+        [
+            InlineKeyboardButton("❌ Rifiuta", callback_data=f"reject|{tg_message_id}"),
+            InlineKeyboardButton("🗑️ Cestino", callback_data=f"trash|{tg_message_id}"),
+        ],
         [
             InlineKeyboardButton(
                 "⭐ Unstar" if starred else "⭐ Star",
@@ -2770,6 +2988,11 @@ async def handle_settings_callback(
         await safe_edit(query.message, text=settings_message_text(runtime), markup=settings_keyboard(runtime))
         await query.answer()
         return True
+    if action == "monitor_labels":
+        summary = "Seleziona le cartelle/categorie Gmail da inoltrare su Telegram."
+        await safe_edit(query.message, text=summary, markup=gmail_monitor_keyboard(runtime))
+        await query.answer()
+        return True
     if action == "dashboard":
         await query.answer()
         await context.bot.send_message(
@@ -2790,6 +3013,31 @@ async def handle_settings_callback(
             reply_to_message_id=query.message.message_id,
         )
         await query.answer()
+        return True
+    if action == "toggle_label":
+        if len(query.data.split("|")) < 3:
+            await query.answer("Label mancante", show_alert=True)
+            return True
+        label_id = query.data.split("|", 2)[2]
+        selected = list(runtime.config.gmail_monitor_labels)
+        if label_id in selected:
+            if len(selected) == 1:
+                await query.answer("Lascia almeno una cartella attiva.", show_alert=True)
+                return True
+            selected = [item for item in selected if item != label_id]
+        else:
+            selected.append(label_id)
+        try:
+            save_runtime_settings(runtime, {"GMAIL_MONITOR_LABELS": json.dumps(selected)})
+        except Exception as exc:
+            await query.answer(f"Config err: {exc}", show_alert=True)
+            return True
+        await safe_edit(
+            query.message,
+            text="Seleziona le cartelle/categorie Gmail da inoltrare su Telegram.",
+            markup=gmail_monitor_keyboard(runtime),
+        )
+        await query.answer("Cartelle aggiornate")
         return True
     if action == "google_api_key":
         await prompt_for_setup_value(
@@ -3083,12 +3331,20 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if action == "ask":
         prompt_message = await context.bot.send_message(
             chat_id=runtime.config.chat_id,
-            text="✏️ Scrivi domanda AI (rispondi qui).",
+            text="✏️ Scrivi il prompt per l'AI su questa mail (rispondi qui).",
             reply_to_message_id=message.message_id,
         )
         runtime.store.add_pending_action(prompt_message.message_id, tg_message_id, "ask")
         runtime.store.purge_old_rows(runtime.config.state_retention_days)
         await query.answer()
+        return
+
+    if action == "analyze":
+        if runtime.model is None:
+            await query.answer("Gemini non configurato.", show_alert=True)
+            return
+        await query.answer("Analisi AI in corso…")
+        await ai_reply_stream(context.application, runtime, state, runtime.config.system_prompt)
         return
 
     if action == "starT":
@@ -3158,9 +3414,15 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         if action == "send":
+            if not state.ai_body:
+                await query.answer("Premi prima 🤖 Analizza AI o usa Prompt AI.", show_alert=True)
+                return
             raw = build_raw(state.sender, "Re: " + state.subject, body_to_send, tracking_markup)
             await asyncio.to_thread(runtime.gmail.send_raw_message, raw, state.gmail_thread_id)
         elif action == "draft":
+            if not state.ai_body:
+                await query.answer("Premi prima 🤖 Analizza AI o usa Prompt AI.", show_alert=True)
+                return
             raw = build_raw(state.sender, "Re: " + state.subject, body_to_send, tracking_markup)
             await asyncio.to_thread(runtime.gmail.create_draft, raw, state.gmail_thread_id)
         elif action == "trash":
@@ -3210,7 +3472,8 @@ async def process_new_email(application: Application, runtime: Runtime, gmail_me
                 attachments=attachments,
                 starred="STARRED" in payload.get("labelIds", []),
                 lang=lang,
-            )
+            ),
+            status_line="Premi 🤖 Analizza AI per generare una proposta di risposta.",
         ),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
@@ -3230,8 +3493,6 @@ async def process_new_email(application: Application, runtime: Runtime, gmail_me
     runtime.store.upsert_email_state(state)
     runtime.store.purge_old_rows(runtime.config.state_retention_days)
     await safe_edit(tg_message, markup=kb_main(state.tg_message_id, state.starred, attachments))
-    if runtime.model is not None:
-        await ai_reply_stream(application, runtime, state, runtime.config.system_prompt)
 
 
 async def watcher(runtime: Runtime, application: Application) -> None:
@@ -3240,7 +3501,11 @@ async def watcher(runtime: Runtime, application: Application) -> None:
     last_seen = runtime.store.get_bot_state(LAST_SEEN_KEY)
     if not last_seen and gmail_ready_for_watch(runtime.config):
         try:
-            recent_ids = await asyncio.to_thread(runtime.gmail.list_recent_inbox_ids, 1)
+            recent_ids = await asyncio.to_thread(
+                runtime.gmail.list_recent_monitored_ids,
+                runtime.config.gmail_monitor_labels,
+                1,
+            )
             if recent_ids:
                 if gmail_initial_sync_pending(runtime):
                     await process_new_email(application, runtime, recent_ids[0])
@@ -3260,7 +3525,10 @@ async def watcher(runtime: Runtime, application: Application) -> None:
                 continue
             continue
         try:
-            recent_ids = await asyncio.to_thread(runtime.gmail.list_recent_inbox_ids)
+            recent_ids = await asyncio.to_thread(
+                runtime.gmail.list_recent_monitored_ids,
+                runtime.config.gmail_monitor_labels,
+            )
             if recent_ids:
                 unseen_ids, newest_seen = split_unseen_inbox_ids(recent_ids, last_seen)
                 if unseen_ids:
