@@ -33,7 +33,7 @@ import google.generativeai as genai
 from hypercorn.asyncio import serve
 from hypercorn.config import Config as HypercornConfig
 from quart import Quart, jsonify, request
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -69,6 +69,11 @@ DEFAULT_PROMPT = (
     "e firma se opportuno."
 )
 DASHBOARD_TOKEN_TTL_SECONDS = 24 * 60 * 60
+TRACKED_DRAFT_RECIPIENT_KEY = "tracked_draft_recipient"
+TRACKED_DRAFT_SUBJECT_KEY = "tracked_draft_subject"
+MENU_TRACKED_EMAIL = "Email Tracciata"
+MENU_STATS = "Stats"
+MENU_SETTINGS = "Impostazioni"
 
 
 class ConfigError(RuntimeError):
@@ -136,6 +141,7 @@ class Config:
     watch_interval: int
     lang: str
     ai_model: str
+    system_prompt: str
     predef_fwd: List[str]
     state_retention_days: int
     telegram_webhook_url: str
@@ -180,6 +186,7 @@ class Config:
         watch_interval_raw = source.get("WATCH_INTERVAL", "15").strip()
         lang = source.get("LANG", "it").strip() or "it"
         ai_model = source.get("AI_MODEL", AI_MODEL).strip() or AI_MODEL
+        system_prompt = source.get("SYSTEM_PROMPT", DEFAULT_PROMPT).strip() or DEFAULT_PROMPT
         predef_fwd = parse_list(source.get("PREDEF_FWD"), PREDEF_FWD)
         state_retention_days_raw = source.get("STATE_RETENTION_DAYS", str(STATE_RETENTION_DAYS)).strip()
         telegram_webhook_url = source.get("TELEGRAM_WEBHOOK_URL", "").strip()
@@ -224,6 +231,7 @@ class Config:
             watch_interval=watch_interval,
             lang=lang,
             ai_model=ai_model,
+            system_prompt=system_prompt,
             predef_fwd=predef_fwd,
             state_retention_days=state_retention_days,
             telegram_webhook_url=telegram_webhook_url,
@@ -302,6 +310,7 @@ class Config:
             "watch_interval": self.watch_interval,
             "lang": self.lang,
             "ai_model": self.ai_model,
+            "system_prompt": self.system_prompt,
             "predef_fwd": list(self.predef_fwd),
             "state_retention_days": self.state_retention_days,
             "public_base_url": self.public_base_url,
@@ -339,6 +348,8 @@ class Config:
             data["lang"] = overrides["LANG"].strip() or data["lang"]
         if "AI_MODEL" in overrides:
             data["ai_model"] = overrides["AI_MODEL"].strip() or data["ai_model"]
+        if "SYSTEM_PROMPT" in overrides:
+            data["system_prompt"] = overrides["SYSTEM_PROMPT"].strip() or data["system_prompt"]
         if "PREDEF_FWD" in overrides:
             data["predef_fwd"] = parse_list(overrides["PREDEF_FWD"], data["predef_fwd"])
         if "STATE_RETENTION_DAYS" in overrides:
@@ -383,6 +394,42 @@ class EmailState:
             starred=bool(row["starred"]),
             lang=row["lang"] or "it",
             ai_body=row["ai_body"] or "",
+            created_at=row["created_at"] or "",
+            updated_at=row["updated_at"] or "",
+        )
+
+
+@dataclass(slots=True)
+class TrackedEmail:
+    tg_message_id: int
+    draft_id: str
+    recipient: str
+    subject: str
+    open_count: int
+    first_opened_at: str
+    last_opened_at: str
+    last_classification: str
+    last_layer: str
+    last_dimensions: str
+    last_confidence: float | None
+    created_at: str = ""
+    updated_at: str = ""
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "TrackedEmail":
+        confidence = row["last_confidence"]
+        return cls(
+            tg_message_id=row["tg_message_id"],
+            draft_id=row["draft_id"] or "",
+            recipient=row["recipient"] or "",
+            subject=row["subject"] or "",
+            open_count=row["open_count"] or 0,
+            first_opened_at=row["first_opened_at"] or "",
+            last_opened_at=row["last_opened_at"] or "",
+            last_classification=row["last_classification"] or "",
+            last_layer=row["last_layer"] or "",
+            last_dimensions=row["last_dimensions"] or "",
+            last_confidence=float(confidence) if confidence is not None else None,
             created_at=row["created_at"] or "",
             updated_at=row["updated_at"] or "",
         )
@@ -477,6 +524,38 @@ class StateStore:
                     value TEXT,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS tracked_emails (
+                    tg_message_id INTEGER PRIMARY KEY,
+                    draft_id TEXT,
+                    recipient TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    open_count INTEGER NOT NULL DEFAULT 0,
+                    first_opened_at TEXT,
+                    last_opened_at TEXT,
+                    last_classification TEXT,
+                    last_layer TEXT,
+                    last_dimensions TEXT,
+                    last_confidence REAL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS pixel_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tg_message_id INTEGER NOT NULL,
+                    classification TEXT,
+                    layer TEXT,
+                    dimensions TEXT,
+                    confidence REAL,
+                    is_user_open INTEGER,
+                    email_subject TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(tg_message_id) REFERENCES tracked_emails(tg_message_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pixel_events_tg_message_id
+                ON pixel_events (tg_message_id);
                 """
             )
 
@@ -486,6 +565,8 @@ class StateStore:
             self._conn.execute("DELETE FROM pending_actions WHERE created_at < ?", (cutoff,))
             self._conn.execute("DELETE FROM interactive_prompts WHERE created_at < ?", (cutoff,))
             self._conn.execute("DELETE FROM email_state WHERE updated_at < ?", (cutoff,))
+            self._conn.execute("DELETE FROM pixel_events WHERE created_at < ?", (cutoff,))
+            self._conn.execute("DELETE FROM tracked_emails WHERE updated_at < ?", (cutoff,))
             self._conn.execute(
                 """
                 DELETE FROM pending_actions
@@ -541,6 +622,121 @@ class StateStore:
                 (tg_message_id,),
             ).fetchone()
         return EmailState.from_row(row) if row else None
+
+    def upsert_tracked_email(self, tracked: TrackedEmail) -> None:
+        created_at = tracked.created_at or utcnow_iso()
+        updated_at = utcnow_iso()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO tracked_emails (
+                    tg_message_id, draft_id, recipient, subject, open_count,
+                    first_opened_at, last_opened_at, last_classification,
+                    last_layer, last_dimensions, last_confidence, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tg_message_id) DO UPDATE SET
+                    draft_id=excluded.draft_id,
+                    recipient=excluded.recipient,
+                    subject=excluded.subject,
+                    open_count=excluded.open_count,
+                    first_opened_at=excluded.first_opened_at,
+                    last_opened_at=excluded.last_opened_at,
+                    last_classification=excluded.last_classification,
+                    last_layer=excluded.last_layer,
+                    last_dimensions=excluded.last_dimensions,
+                    last_confidence=excluded.last_confidence,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    tracked.tg_message_id,
+                    tracked.draft_id,
+                    tracked.recipient,
+                    tracked.subject,
+                    tracked.open_count,
+                    tracked.first_opened_at,
+                    tracked.last_opened_at,
+                    tracked.last_classification,
+                    tracked.last_layer,
+                    tracked.last_dimensions,
+                    tracked.last_confidence,
+                    created_at,
+                    updated_at,
+                ),
+            )
+
+    def get_tracked_email(self, tg_message_id: int) -> TrackedEmail | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM tracked_emails WHERE tg_message_id = ?",
+                (tg_message_id,),
+            ).fetchone()
+        return TrackedEmail.from_row(row) if row else None
+
+    def list_tracked_emails(self, limit: int = 10) -> List[TrackedEmail]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tracked_emails ORDER BY updated_at DESC, tg_message_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [TrackedEmail.from_row(row) for row in rows]
+
+    def record_pixel_event(
+        self,
+        *,
+        tg_message_id: int,
+        classification: str,
+        layer: str,
+        dimensions: str,
+        confidence: float | None,
+        is_user_open: bool | None,
+        email_subject: str,
+    ) -> TrackedEmail | None:
+        tracked = self.get_tracked_email(tg_message_id)
+        if tracked is None:
+            return None
+        event_time = utcnow_iso()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO pixel_events (
+                    tg_message_id, classification, layer, dimensions, confidence,
+                    is_user_open, email_subject, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tg_message_id,
+                    classification,
+                    layer,
+                    dimensions,
+                    confidence,
+                    None if is_user_open is None else int(is_user_open),
+                    email_subject,
+                    event_time,
+                ),
+            )
+            first_opened_at = tracked.first_opened_at or event_time
+            open_count = tracked.open_count + 1
+            self._conn.execute(
+                """
+                UPDATE tracked_emails
+                SET open_count = ?, first_opened_at = ?, last_opened_at = ?,
+                    last_classification = ?, last_layer = ?, last_dimensions = ?,
+                    last_confidence = ?, updated_at = ?
+                WHERE tg_message_id = ?
+                """,
+                (
+                    open_count,
+                    first_opened_at,
+                    event_time,
+                    classification,
+                    layer,
+                    dimensions,
+                    confidence,
+                    event_time,
+                    tg_message_id,
+                ),
+            )
+        return self.get_tracked_email(tg_message_id)
 
     def update_ai_body(self, tg_message_id: int, ai_body: str) -> None:
         with self._lock, self._conn:
@@ -830,11 +1026,11 @@ class GmailClient:
             .execute()
         )
 
-    def create_draft(self, raw: str, thread_id: str) -> None:
+    def create_draft(self, raw: str, thread_id: str) -> dict:
         message_body = {"raw": raw}
         if thread_id:
             message_body["threadId"] = thread_id
-        self.call(
+        return self.call(
             lambda svc: svc.users()
             .drafts()
             .create(userId="me", body={"message": message_body})
@@ -964,6 +1160,13 @@ def build_raw(to_addr: str, subject: str, plain: str, tracking_markup: str | Non
     return base64.urlsafe_b64encode(message.as_bytes()).decode()
 
 
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[MENU_TRACKED_EMAIL, MENU_STATS], [MENU_SETTINGS]],
+        resize_keyboard=True,
+    )
+
+
 def gmail_call(runtime: Runtime, fn: Callable[[Any], Any]) -> Any:
     return runtime.gmail.call(fn)
 
@@ -993,6 +1196,78 @@ def format_email_text(
     if status_line:
         parts.extend(["", "---", ihtml.escape(status_line)])
     return "\n".join(parts)
+
+
+def settings_message_text(runtime: Runtime) -> str:
+    prompt_preview = ihtml.escape(shorten_text(runtime.config.system_prompt, limit=160))
+    public_base_url = ihtml.escape(runtime.config.resolved_public_base_url() or "missing")
+    lines = [
+        "Impostazioni rapide:",
+        "",
+        f"- Gemini key: {'set' if ai_configured(runtime.config) else 'missing'}",
+        f"- Gmail OAuth: {'set' if google_credentials_available(runtime.config) else 'missing'}",
+        f"- Gmail token: {'set' if google_token_available(runtime.config) else 'missing'}",
+        f"- Pixel: {'enabled' if runtime.config.enable_pixel else 'disabled'}",
+        f"- Public URL: {public_base_url}",
+        "",
+        "Prompt di sistema Gemini:",
+        prompt_preview,
+    ]
+    return "\n".join(lines)
+
+
+def tracked_email_status_summary(tracked: TrackedEmail) -> str:
+    if tracked.open_count <= 0:
+        return "Mai aperta"
+    reopen_count = max(0, tracked.open_count - 1)
+    security = "bassa"
+    if tracked.last_classification == "human_browser":
+        if tracked.last_confidence is not None and tracked.last_confidence >= 0.85:
+            security = "alta"
+        else:
+            security = "media"
+    elif tracked.last_confidence is not None and tracked.last_confidence >= 0.75:
+        security = "media"
+    pieces = [f"Aperta {tracked.open_count} volta{'e' if tracked.open_count != 1 else ''}"]
+    if reopen_count:
+        pieces.append(f"riaperta {reopen_count} volta{'e' if reopen_count != 1 else ''}")
+    if tracked.last_classification:
+        pieces.append(tracked.last_classification.replace("_", " "))
+    if tracked.last_layer:
+        pieces.append(f"via {tracked.last_layer}")
+    if tracked.last_confidence is not None:
+        pieces.append(f"sicurezza {security} ({tracked.last_confidence:.2f})")
+    else:
+        pieces.append(f"sicurezza {security}")
+    return " · ".join(pieces)
+
+
+def format_tracked_email_text(tracked: TrackedEmail, note: str | None = None) -> str:
+    lines = [
+        f"🛰️ <b>{ihtml.escape(tracked.subject or '(senza oggetto)')}</b>",
+        f"To: <code>{ihtml.escape(tracked.recipient)}</code>",
+        "",
+        ihtml.escape(tracked_email_status_summary(tracked)),
+    ]
+    if tracked.last_opened_at:
+        lines.append(ihtml.escape(f"Ultima apertura: {tracked.last_opened_at}"))
+    if note:
+        lines.extend(["", "---", ihtml.escape(note)])
+    return "\n".join(lines)
+
+
+def tracked_stats_text(tracked_items: List[TrackedEmail]) -> str:
+    if not tracked_items:
+        return "📊 Nessuna email tracciata ancora."
+    lines = ["📊 <b>Email tracciate</b>", ""]
+    for index, tracked in enumerate(tracked_items, start=1):
+        lines.append(f"{index}. <b>{ihtml.escape(tracked.subject or '(senza oggetto)')}</b>")
+        lines.append(f"To: <code>{ihtml.escape(tracked.recipient)}</code>")
+        lines.append(ihtml.escape(tracked_email_status_summary(tracked)))
+        if tracked.last_opened_at:
+            lines.append(ihtml.escape(f"Ultima apertura: {tracked.last_opened_at}"))
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def b64url_encode(data: bytes) -> str:
@@ -1202,6 +1477,43 @@ def setup_keyboard(runtime: Runtime) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def settings_keyboard(runtime: Runtime) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("Status", callback_data="settings|status"),
+            InlineKeyboardButton("Prompt Gemini", callback_data="settings|system_prompt"),
+        ],
+        [
+            InlineKeyboardButton("Gemini key", callback_data="settings|google_api_key"),
+            InlineKeyboardButton("Public URL", callback_data="settings|public_base_url"),
+        ],
+        [
+            InlineKeyboardButton("Pixel URL", callback_data="settings|pixel_base_url"),
+            InlineKeyboardButton("Pixel secret", callback_data="settings|pixel_webhook_secret"),
+        ],
+        [
+            InlineKeyboardButton(
+                "Pixel ON/OFF",
+                callback_data="settings|toggle_pixel",
+            ),
+            InlineKeyboardButton("OAuth JSON", callback_data="settings|oauth_json"),
+        ],
+    ]
+    if google_credentials_available(runtime.config):
+        rows.append([InlineKeyboardButton("Connect Gmail", callback_data="settings|gmail_login")])
+    rows.append([InlineKeyboardButton("Open dashboard", callback_data="settings|dashboard")])
+    return InlineKeyboardMarkup(rows)
+
+
+def stats_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Aggiorna", callback_data="stats|refresh"),
+            InlineKeyboardButton("Nuova email tracciata", callback_data="tracked|new"),
+        ]]
+    )
+
+
 def setup_message_text(runtime: Runtime) -> str:
     redirect_uri = google_oauth_redirect_url(runtime.config)
     lines = ["Self-hosted setup status:", ""] + [f"- {line}" for line in setup_status_lines(runtime)]
@@ -1329,6 +1641,7 @@ BOT_CONFIG_ALIASES = {
     "watch_interval": "WATCH_INTERVAL",
     "lang": "LANG",
     "ai_model": "AI_MODEL",
+    "system_prompt": "SYSTEM_PROMPT",
     "predef_fwd": "PREDEF_FWD",
     "state_retention_days": "STATE_RETENTION_DAYS",
     "telegram_webhook_url": "TELEGRAM_WEBHOOK_URL",
@@ -1346,11 +1659,11 @@ def normalize_bot_config_key(raw: str) -> str:
     return normalized
 
 
-def build_tracking_markup(config: Config, state: EmailState) -> str:
+def build_tracking_markup_for_message_id(config: Config, tg_message_id: int) -> str:
     if not (config.enable_pixel and config.pixel_base_url):
         return ""
     base_url = config.pixel_base_url
-    token = make_tracking_token(config, state.tg_message_id)
+    token = make_tracking_token(config, tg_message_id)
     nonce = uuid4().hex[:10]
     img_url = f"{base_url}/track/img/2x1/{token}.png"
     bg_url = f"{base_url}/track/bg/2x1/{token}.png"
@@ -1374,6 +1687,10 @@ def build_tracking_markup(config: Config, state: EmailState) -> str:
         f"@font-face {{ font-family:'grtrack-{nonce}'; src:url('{font_url}') format('woff2'); font-style:normal; font-weight:400; }}"
         "</style>"
     )
+
+
+def build_tracking_markup(config: Config, state: EmailState) -> str:
+    return build_tracking_markup_for_message_id(config, state.tg_message_id)
 
 
 def split_unseen_inbox_ids(recent_ids: List[str], last_seen: str | None) -> tuple[List[str], str | None]:
@@ -1464,6 +1781,13 @@ EDITABLE_DASHBOARD_FIELDS = [
         label="AI model",
         kind="text",
         help_text="Gemini model name used for reply generation.",
+    ),
+    DashboardField(
+        key="SYSTEM_PROMPT",
+        attr="system_prompt",
+        label="Gemini system prompt",
+        kind="textarea",
+        help_text="Default instruction used for automatic AI drafts.",
     ),
     DashboardField(
         key="PREDEF_FWD",
@@ -2066,6 +2390,29 @@ async def send_setup_message(message, runtime: Runtime, text: str | None = None)
     )
 
 
+async def send_main_menu(message, text: str = "Menu pronto.") -> None:
+    await message.reply_text(text, reply_markup=main_menu_keyboard())
+
+
+async def send_settings_message(message, runtime: Runtime, text: str | None = None) -> None:
+    await message.reply_text(
+        text or settings_message_text(runtime),
+        reply_markup=settings_keyboard(runtime),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def send_tracked_stats(message, runtime: Runtime) -> None:
+    tracked_items = runtime.store.list_tracked_emails(limit=10)
+    await message.reply_text(
+        tracked_stats_text(tracked_items),
+        reply_markup=stats_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
 async def prompt_for_setup_value(
     context: ContextTypes.DEFAULT_TYPE,
     runtime: Runtime,
@@ -2130,7 +2477,8 @@ async def ai_reply_stream(
         reply_to_message_id=state.tg_message_id,
     )
     accumulated = ""
-    async for chunk in ai_stream(runtime.model, prompt or DEFAULT_PROMPT, state.body, state.lang):
+    effective_prompt = prompt or runtime.config.system_prompt or DEFAULT_PROMPT
+    async for chunk in ai_stream(runtime.model, effective_prompt, state.body, state.lang):
         accumulated += chunk
         if len(accumulated) >= TELEGRAM_MAX:
             break
@@ -2144,12 +2492,82 @@ async def ai_reply_stream(
     await safe_edit(progress, text=format_email_text(state, body_override=final_text))
 
 
+def validate_email_address(raw: str) -> str:
+    email_addr = parseaddr(raw)[1].strip()
+    if not email_addr or "@" not in email_addr:
+        raise ConfigError("Inserisci un indirizzo email valido.")
+    return email_addr
+
+
+async def begin_tracked_email_flow(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime: Runtime,
+) -> None:
+    if not runtime.config.enable_pixel or not runtime.config.pixel_base_url:
+        await message.reply_text(
+            "Il pixel non è configurato. Apri Impostazioni o /dashboard e completa Pixel URL + secret prima di creare email tracciate."
+        )
+        return
+    await prompt_for_setup_value(
+        context,
+        runtime,
+        prompt_text="Rispondi a questo messaggio con l'indirizzo destinatario della bozza tracciata.",
+        action_kind="tracked_email_recipient",
+        reply_to_message_id=message.message_id,
+    )
+
+
+async def create_tracked_draft(
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime: Runtime,
+    *,
+    recipient: str,
+    subject: str,
+) -> None:
+    placeholder = await context.bot.send_message(
+        chat_id=runtime.config.chat_id,
+        text="🛰️ Creo la bozza tracciata…",
+        parse_mode=ParseMode.HTML,
+    )
+    tracking_markup = build_tracking_markup_for_message_id(runtime.config, placeholder.message_id)
+    raw = build_raw(recipient, subject, "", tracking_markup)
+    try:
+        draft_payload = await asyncio.to_thread(runtime.gmail.create_draft, raw, "")
+    except Exception as exc:
+        LOGGER.exception("Tracked draft creation failed.")
+        await safe_edit(
+            placeholder,
+            text=f"🛰️ <b>{ihtml.escape(subject)}</b>\n\nErrore nella creazione della bozza: {ihtml.escape(str(exc))}",
+        )
+        return
+
+    tracked = TrackedEmail(
+        tg_message_id=placeholder.message_id,
+        draft_id=(draft_payload or {}).get("id", ""),
+        recipient=recipient,
+        subject=subject,
+        open_count=0,
+        first_opened_at="",
+        last_opened_at="",
+        last_classification="",
+        last_layer="",
+        last_dimensions="",
+        last_confidence=None,
+    )
+    runtime.store.upsert_tracked_email(tracked)
+    runtime.store.purge_old_rows(runtime.config.state_retention_days)
+    note = "Bozza creata. Apri Gmail > Drafts, completa il testo e inviala."
+    await safe_edit(placeholder, text=format_tracked_email_text(tracked, note=note), markup=stats_keyboard())
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     claimed = await claim_owner_if_needed(update, context)
     if not claimed:
         await deny_unauthorized(update)
         return
     runtime = get_runtime(context.application)
+    await send_main_menu(update.effective_message, "Menu Telegram attivato.")
     await send_setup_message(
         update.effective_message,
         runtime,
@@ -2163,7 +2581,14 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await deny_unauthorized(update)
         return
     runtime = get_runtime(context.application)
+    await send_main_menu(update.effective_message)
     await send_setup_message(update.effective_message, runtime)
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update, context):
+        return
+    await send_main_menu(update.effective_message)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2171,6 +2596,27 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     runtime = get_runtime(context.application)
     await send_setup_message(update.effective_message, runtime)
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update, context):
+        return
+    runtime = get_runtime(context.application)
+    await send_settings_message(update.effective_message, runtime)
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update, context):
+        return
+    runtime = get_runtime(context.application)
+    await send_tracked_stats(update.effective_message, runtime)
+
+
+async def cmd_tracked_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update, context):
+        return
+    runtime = get_runtime(context.application)
+    await begin_tracked_email_flow(update.effective_message, context, runtime)
 
 
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2311,6 +2757,134 @@ async def handle_setup_callback(
     return False
 
 
+async def handle_settings_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime: Runtime,
+    action: str,
+) -> bool:
+    query = update.callback_query
+    if query is None or query.message is None:
+        return False
+    if action == "status":
+        await safe_edit(query.message, text=settings_message_text(runtime), markup=settings_keyboard(runtime))
+        await query.answer()
+        return True
+    if action == "dashboard":
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=runtime.config.chat_id,
+            text="Dashboard privata pronta.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Open dashboard", url=dashboard_url(runtime.config))]]
+            ),
+            disable_web_page_preview=True,
+        )
+        return True
+    if action == "system_prompt":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text="Rispondi con il nuovo prompt di sistema di Gemini. Verra' usato per le bozze AI automatiche.",
+            action_kind="setup_system_prompt",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
+    if action == "google_api_key":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text="Rispondi a questo messaggio con la tua `GOOGLE_API_KEY`.",
+            action_kind="setup_google_api_key",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
+    if action == "public_base_url":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text="Rispondi con la `PUBLIC_BASE_URL` pubblica del bot.",
+            action_kind="setup_public_base_url",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
+    if action == "pixel_base_url":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text="Rispondi con la `PIXEL_BASE_URL`, ad esempio il tuo Worker/endpoint pubblico.",
+            action_kind="setup_pixel_base_url",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
+    if action == "pixel_webhook_secret":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text="Rispondi con la `PIXEL_WEBHOOK_SECRET` condivisa col pixel worker.",
+            action_kind="setup_pixel_webhook_secret",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
+    if action == "toggle_pixel":
+        try:
+            new_value = "0" if runtime.config.enable_pixel else "1"
+            save_runtime_settings(runtime, {"ENABLE_PIXEL": new_value})
+        except Exception as exc:
+            await query.answer(f"Config err: {exc}", show_alert=True)
+            return True
+        await safe_edit(query.message, text=settings_message_text(runtime), markup=settings_keyboard(runtime))
+        await query.answer("Pixel aggiornato")
+        return True
+    if action == "oauth_json":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text="Carica qui il file JSON del client OAuth Google di tipo Web, oppure incolla il JSON completo come testo.",
+            action_kind="setup_google_oauth_json",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
+    if action == "gmail_login":
+        try:
+            auth_url = start_google_oauth(runtime)
+        except Exception as exc:
+            await query.answer(f"Non pronto: {exc}", show_alert=True)
+            return True
+        await context.bot.send_message(
+            chat_id=runtime.config.chat_id,
+            text="Apri il link per collegare Gmail. Il token viene salvato al ritorno da Google.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Connect Gmail", url=auth_url)]]),
+            disable_web_page_preview=True,
+        )
+        await query.answer()
+        return True
+    return False
+
+
+async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update, context):
+        return
+    message = update.effective_message
+    if message is None or not message.text or message.reply_to_message is not None:
+        return
+    runtime = get_runtime(context.application)
+    if message.text == MENU_TRACKED_EMAIL:
+        await begin_tracked_email_flow(message, context, runtime)
+        return
+    if message.text == MENU_STATS:
+        await send_tracked_stats(message, runtime)
+        return
+    if message.text == MENU_SETTINGS:
+        await send_settings_message(message, runtime)
+
+
 async def txt_followup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update, context):
         return
@@ -2340,6 +2914,24 @@ async def txt_followup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 save_runtime_settings(runtime, {"PUBLIC_BASE_URL": raw_text})
                 await send_setup_message(message, runtime, "Public base URL salvata.")
                 return
+            if interactive.action_kind == "setup_pixel_base_url":
+                if not raw_text:
+                    raise ConfigError("Serve una PIXEL_BASE_URL testuale.")
+                save_runtime_settings(runtime, {"PIXEL_BASE_URL": raw_text})
+                await send_settings_message(message, runtime, "Pixel base URL salvata.")
+                return
+            if interactive.action_kind == "setup_pixel_webhook_secret":
+                if not raw_text:
+                    raise ConfigError("Serve una PIXEL_WEBHOOK_SECRET testuale.")
+                save_runtime_settings(runtime, {"PIXEL_WEBHOOK_SECRET": raw_text})
+                await send_settings_message(message, runtime, "Pixel webhook secret salvata.")
+                return
+            if interactive.action_kind == "setup_system_prompt":
+                if not raw_text:
+                    raise ConfigError("Serve un prompt testuale.")
+                save_runtime_settings(runtime, {"SYSTEM_PROMPT": raw_text})
+                await send_settings_message(message, runtime, "Prompt Gemini salvato.")
+                return
             if interactive.action_kind == "setup_google_oauth_json":
                 if document_bytes is not None:
                     raw_text = document_bytes.decode("utf-8")
@@ -2363,6 +2955,29 @@ async def txt_followup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     runtime,
                     "Google OAuth client JSON salvato. Ora puoi usare /gmail_login o il bottone Connect Gmail.",
                 )
+                return
+            if interactive.action_kind == "tracked_email_recipient":
+                recipient = validate_email_address(raw_text)
+                runtime.store.set_bot_state(TRACKED_DRAFT_RECIPIENT_KEY, recipient)
+                await prompt_for_setup_value(
+                    context,
+                    runtime,
+                    prompt_text="Perfetto. Ora rispondi con l'oggetto della bozza tracciata.",
+                    action_kind="tracked_email_subject",
+                    reply_to_message_id=message.message_id,
+                )
+                return
+            if interactive.action_kind == "tracked_email_subject":
+                subject = raw_text.strip()
+                if not subject:
+                    raise ConfigError("Serve un oggetto non vuoto.")
+                recipient = runtime.store.get_bot_state(TRACKED_DRAFT_RECIPIENT_KEY) or ""
+                if not recipient:
+                    raise ConfigError("Destinatario non trovato. Premi di nuovo Email Tracciata.")
+                runtime.store.set_bot_state(TRACKED_DRAFT_SUBJECT_KEY, subject)
+                await create_tracked_draft(context, runtime, recipient=recipient, subject=subject)
+                runtime.store.set_bot_state(TRACKED_DRAFT_RECIPIENT_KEY, "")
+                runtime.store.set_bot_state(TRACKED_DRAFT_SUBJECT_KEY, "")
                 return
             await message.reply_text("Prompt interattivo non riconosciuto.")
             return
@@ -2417,6 +3032,21 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         handled = await handle_setup_callback(update, context, runtime, parts[1] if len(parts) > 1 else "")
         if not handled:
             await query.answer("Unsupported", show_alert=True)
+        return
+    if action == "settings":
+        handled = await handle_settings_callback(update, context, runtime, parts[1] if len(parts) > 1 else "")
+        if not handled:
+            await query.answer("Unsupported", show_alert=True)
+        return
+    if action == "stats":
+        if query.message is not None:
+            await safe_edit(query.message, text=tracked_stats_text(runtime.store.list_tracked_emails(limit=10)), markup=stats_keyboard())
+        await query.answer()
+        return
+    if action == "tracked":
+        if query.message is not None:
+            await begin_tracked_email_flow(query.message, context, runtime)
+        await query.answer()
         return
     tg_message_id = int(parts[1])
     state = runtime.store.get_email_state(tg_message_id)
@@ -2601,7 +3231,7 @@ async def process_new_email(application: Application, runtime: Runtime, gmail_me
     runtime.store.purge_old_rows(runtime.config.state_retention_days)
     await safe_edit(tg_message, markup=kb_main(state.tg_message_id, state.starred, attachments))
     if runtime.model is not None:
-        await ai_reply_stream(application, runtime, state, DEFAULT_PROMPT)
+        await ai_reply_stream(application, runtime, state, runtime.config.system_prompt)
 
 
 async def watcher(runtime: Runtime, application: Application) -> None:
@@ -2806,11 +3436,31 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
         layer = data.get("layer") or "img"
         dimensions = data.get("dimensions") or ""
         confidence = data.get("confidence")
+        try:
+            confidence_value = float(confidence) if confidence not in (None, "") else None
+        except (TypeError, ValueError):
+            confidence_value = None
+        is_user_open_value: bool | None
+        if is_user_open is None:
+            is_user_open_value = None
+        elif isinstance(is_user_open, bool):
+            is_user_open_value = is_user_open
+        else:
+            is_user_open_value = parse_bool(str(is_user_open), default=False)
 
         if not tg_message_id:
             return jsonify({"status": "error", "message": "tg_msg_id missing"}), 400
 
         original = runtime.store.get_email_state(int(tg_message_id))
+        tracked = runtime.store.record_pixel_event(
+            tg_message_id=int(tg_message_id),
+            classification=classification,
+            layer=layer,
+            dimensions=dimensions,
+            confidence=confidence_value,
+            is_user_open=is_user_open_value,
+            email_subject=email_subject,
+        )
         if original:
             if classification:
                 icon = "✅" if classification == "human_browser" else "⚠️"
@@ -2825,6 +3475,9 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
                 original,
                 status_line=f"{status_text} {f'[{email_subject}]' if email_subject else ''}".strip(),
             )
+        elif tracked:
+            note = email_subject or "Evento pixel ricevuto."
+            text = format_tracked_email_text(tracked, note=note)
         else:
             fallback = EmailState(
                 tg_message_id=int(tg_message_id),
@@ -2899,14 +3552,28 @@ def build_application(runtime: Runtime) -> Application:
     )
     application.bot_data["runtime"] = runtime
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("menu", cmd_menu))
     application.add_handler(CommandHandler("setup", cmd_setup))
+    application.add_handler(CommandHandler("settings", cmd_settings))
     application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("stats", cmd_stats))
+    application.add_handler(CommandHandler("tracked", cmd_tracked_email))
     application.add_handler(CommandHandler("config", cmd_dashboard))
     application.add_handler(CommandHandler("dashboard", cmd_dashboard))
     application.add_handler(CommandHandler("gmail_login", cmd_gmail_login))
     application.add_handler(CommandHandler("set", cmd_set))
     application.add_handler(CommandHandler("unset", cmd_unset))
     application.add_handler(CallbackQueryHandler(cb_btn))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND
+            & filters.Regex(
+                rf"^({re.escape(MENU_TRACKED_EMAIL)}|{re.escape(MENU_STATS)}|{re.escape(MENU_SETTINGS)})$"
+            ),
+            handle_menu_text,
+        )
+    )
     application.add_handler(
         MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.Document.ALL, txt_followup)
     )

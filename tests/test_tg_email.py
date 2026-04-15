@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from googleapiclient.errors import HttpError
 
@@ -16,9 +16,11 @@ from tg_email import (
     Runtime,
     Config,
     ConfigError,
+    DEFAULT_PROMPT,
     EmailState,
     GmailClient,
     StateStore,
+    TrackedEmail,
     build_candidate_config,
     build_application,
     claim_owner,
@@ -36,6 +38,8 @@ from tg_email import (
     split_unseen_inbox_ids,
     start_google_oauth,
     startup_notice_text,
+    tracked_email_status_summary,
+    tracked_stats_text,
     verify_dashboard_token,
 )
 
@@ -99,6 +103,13 @@ class ConfigTests(unittest.TestCase):
             stored = json.loads(cfg.gmail_token_path.read_text())
             self.assertEqual(stored["refresh_token"], "fresh-refresh-token")
 
+    def test_system_prompt_defaults_and_override(self) -> None:
+        cfg = Config.from_env({"TELEGRAM_BOT_TOKEN": "token"})
+        self.assertEqual(cfg.system_prompt, DEFAULT_PROMPT)
+
+        overridden = cfg.with_overrides({"SYSTEM_PROMPT": "Prompt custom"})
+        self.assertEqual(overridden.system_prompt, "Prompt custom")
+
 
 class StateStoreTests(unittest.TestCase):
     def test_email_state_pending_actions_and_purge(self) -> None:
@@ -152,6 +163,42 @@ class StateStoreTests(unittest.TestCase):
             self.assertEqual(store.get_app_settings()["WATCH_INTERVAL"], "42")
             store.delete_app_setting("LANG")
             self.assertNotIn("LANG", store.get_app_settings())
+            store.close()
+
+    def test_tracked_email_pixel_event_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = StateStore(Path(tmpdir) / "state.db")
+            tracked = TrackedEmail(
+                tg_message_id=301,
+                draft_id="draft-1",
+                recipient="lead@example.com",
+                subject="Hello",
+                open_count=0,
+                first_opened_at="",
+                last_opened_at="",
+                last_classification="",
+                last_layer="",
+                last_dimensions="",
+                last_confidence=None,
+            )
+            store.upsert_tracked_email(tracked)
+            updated = store.record_pixel_event(
+                tg_message_id=301,
+                classification="human_browser",
+                layer="font",
+                dimensions="2x1",
+                confidence=0.91,
+                is_user_open=True,
+                email_subject="Hello",
+            )
+
+            self.assertIsNotNone(updated)
+            assert updated is not None
+            self.assertEqual(updated.open_count, 1)
+            self.assertEqual(updated.last_layer, "font")
+            self.assertAlmostEqual(updated.last_confidence or 0, 0.91, places=2)
+            self.assertIn("sicurezza alta", tracked_email_status_summary(updated))
+            self.assertIn("Hello", tracked_stats_text([updated]))
             store.close()
 
 
@@ -593,6 +640,72 @@ class WebAppSmokeTests(unittest.TestCase):
                     self.assertIn("OAuth state expired", body)
                 finally:
                     store.close()
+
+        asyncio.run(run())
+
+    def test_pixel_status_updates_tracked_email(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cfg = Config.from_env(
+                    {
+                        "TELEGRAM_BOT_TOKEN": "token",
+                        "TELEGRAM_CHAT_ID": "123",
+                        "PIXEL_BASE_URL": "https://pixel.example.com",
+                        "PIXEL_WEBHOOK_SECRET": "secret",
+                        "ENABLE_PIXEL": "1",
+                        "DATA_DIR": tmpdir,
+                    }
+                )
+                store = StateStore(Path(tmpdir) / "state.db")
+                runtime = Runtime(
+                    base_config=cfg,
+                    config=cfg,
+                    startup_overrides={},
+                    store=store,
+                    gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+                    model=None,
+                    shutdown_event=asyncio.Event(),
+                    mode="polling",
+                )
+                store.upsert_tracked_email(
+                    TrackedEmail(
+                        tg_message_id=444,
+                        draft_id="draft-1",
+                        recipient="lead@example.com",
+                        subject="Tracked subject",
+                        open_count=0,
+                        first_opened_at="",
+                        last_opened_at="",
+                        last_classification="",
+                        last_layer="",
+                        last_dimensions="",
+                        last_confidence=None,
+                    )
+                )
+                app = build_application(runtime)
+                web = create_web_app(runtime, app)
+                client = web.test_client()
+                with patch.object(type(app.bot), "edit_message_text", new_callable=AsyncMock) as mocked:
+                    response = await client.post(
+                        "/pixel_status",
+                        headers={"X-Pixel-Secret": "secret"},
+                        json={
+                            "tg_msg_id": 444,
+                            "classification": "human_browser",
+                            "layer": "font",
+                            "dimensions": "2x1",
+                            "confidence": 0.9,
+                            "email_subject": "Tracked subject",
+                        },
+                    )
+
+                    self.assertEqual(response.status_code, 200)
+                    tracked = store.get_tracked_email(444)
+                    self.assertIsNotNone(tracked)
+                    assert tracked is not None
+                    self.assertEqual(tracked.open_count, 1)
+                    mocked.assert_awaited_once()
+                store.close()
 
         asyncio.run(run())
 
