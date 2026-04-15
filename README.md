@@ -17,14 +17,8 @@ It watches Gmail, forwards each new inbox message to Telegram, streams a Gemini 
 | Telegram App | <-> | GlassyReply Python bot | <--> | Gemini API       |
 +-------------+     | tg_email.py             |      +------------------+
                     | SQLite state + Quart    |
-                    | / landing + dashboard    |
-                    +-----+--------------+----+
-                          |              |
-               /pixel_status webhook     | optional outbound tracking HTML
-                          |              |
-                    +-----v--------------v----+
-                    | Cloudflare Worker pixel |
-                    | img/bg/dark/font beacons|
+                    | /landing + dashboard    |
+                    | /track/* self-hosted    |
                     +-------------------------+
 ```
 
@@ -51,7 +45,6 @@ It watches Gmail, forwards each new inbox message to Telegram, streams a Gemini 
 - Telegram bot token
 - Optional bootstrap owner Telegram user ID
 - Optional bootstrap Gemini API key
-- Optional: Cloudflare account for the Worker-based pixel tracker
 - Optional: Fly.io CLI for bot deployment
 
 ## Quick start
@@ -96,8 +89,8 @@ Recommended local paths:
 Optional runtime values:
 
 - `ENABLE_PIXEL=true`
-- `PIXEL_BASE_URL=https://your-worker.workers.dev`
 - `PIXEL_WEBHOOK_SECRET=shared-secret`
+- `PIXEL_BASE_URL=https://another-host.example.com` only if you want an external tracker instead of the built-in Fly routes
 - `TELEGRAM_WEBHOOK_URL=https://your-public-host`
 - `TELEGRAM_WEBHOOK_SECRET=telegram-secret`
 
@@ -271,6 +264,23 @@ Fly checks:
 
 Pixel tracking is optional and intentionally classified as telemetry, not truth.
 
+### Recommended setup: self-hosted on Fly
+
+The bot can now serve the tracking assets directly from the same Fly app:
+
+- `/track/img/...`
+- `/track/bg/...`
+- `/track/dark/...`
+- `/track/font/...`
+
+That means the simplest production setup is:
+
+- enable the pixel in Telegram settings
+- set `PIXEL_WEBHOOK_SECRET`
+- leave `PIXEL_BASE_URL` empty
+
+When `PIXEL_BASE_URL` is empty, GlassyReply automatically uses `PUBLIC_BASE_URL`, so the pixel stays fully proprietary on your Fly deployment.
+
 ### Why multilayer?
 
 - Gmail image proxy still fetches images, but it is a proxy signal.
@@ -279,6 +289,26 @@ Pixel tracking is optional and intentionally classified as telemetry, not truth.
 - Font fetches are niche and diagnostic only.
 
 Research notes: [docs/pixel-tracker-research.md](/Users/mnbrain/GlassyReply/docs/pixel-tracker-research.md)
+
+### Self-hosted smoke check
+
+Once Fly is live, the built-in tracker is served by the same app under:
+
+```bash
+https://glassyreply-bot.fly.dev/track/img/2x1/<signed-token>.png
+https://glassyreply-bot.fly.dev/track/font/<signed-token>.woff2
+```
+
+The token must be signed by the bot, so the easiest real test is still:
+
+1. enable the pixel
+2. create `Email Tracciata`
+3. open/send the draft from Gmail
+4. watch `Stats` in Telegram update
+
+### Optional Cloudflare Worker mode
+
+Cloudflare is no longer required. The Worker remains optional if you specifically want a separate edge-hosted tracker.
 
 ### Local worker dev
 
@@ -356,6 +386,7 @@ playwright screenshot -b chromium \
 - Only the configured Telegram owner can use bot handlers.
 - `PIXEL_WEBHOOK_SECRET` is checked before parsing pixel webhook JSON.
 - Pixel tokens are signed.
+- The same Fly app can now serve the signed tracking assets directly.
 - Gmail state and pending Telegram follow-ups persist in SQLite.
 
 ## Files worth knowing

@@ -30,6 +30,7 @@ from tg_email import (
     google_oauth_state_payload,
     google_web_client_config,
     mark_gmail_initial_sync_pending,
+    make_tracking_token,
     make_dashboard_token,
     owner_configured,
     is_authorized_update,
@@ -486,7 +487,12 @@ class DashboardConfigTests(unittest.TestCase):
             )
             try:
                 with self.assertRaises(ConfigError):
-                    build_candidate_config(runtime, {"ENABLE_PIXEL": "1"})
+                    build_candidate_config(runtime, {"ENABLE_PIXEL": "1", "PIXEL_WEBHOOK_SECRET": ""})
+                candidate = build_candidate_config(
+                    runtime,
+                    {"ENABLE_PIXEL": "1", "PIXEL_WEBHOOK_SECRET": "secret"},
+                )
+                self.assertEqual(candidate.resolved_pixel_base_url(), candidate.resolved_public_base_url())
             finally:
                 runtime.store.close()
 
@@ -741,6 +747,68 @@ class WebAppSmokeTests(unittest.TestCase):
                     self.assertIsNotNone(tracked)
                     assert tracked is not None
                     self.assertEqual(tracked.open_count, 1)
+                    mocked.assert_awaited_once()
+                store.close()
+
+        asyncio.run(run())
+
+    def test_self_hosted_track_route_updates_tracked_email(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cfg = Config.from_env(
+                    {
+                        "TELEGRAM_BOT_TOKEN": "token",
+                        "TELEGRAM_CHAT_ID": "123",
+                        "PUBLIC_BASE_URL": "https://glassyreply-bot.fly.dev",
+                        "PIXEL_WEBHOOK_SECRET": "secret",
+                        "ENABLE_PIXEL": "1",
+                        "DATA_DIR": tmpdir,
+                    }
+                )
+                store = StateStore(Path(tmpdir) / "state.db")
+                runtime = Runtime(
+                    base_config=cfg,
+                    config=cfg,
+                    startup_overrides={},
+                    store=store,
+                    gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+                    model=None,
+                    shutdown_event=asyncio.Event(),
+                    mode="polling",
+                )
+                store.upsert_tracked_email(
+                    TrackedEmail(
+                        tg_message_id=555,
+                        draft_id="draft-2",
+                        recipient="lead@example.com",
+                        subject="Self hosted pixel",
+                        open_count=0,
+                        first_opened_at="",
+                        last_opened_at="",
+                        last_classification="",
+                        last_layer="",
+                        last_dimensions="",
+                        last_confidence=None,
+                    )
+                )
+                app = build_application(runtime)
+                web = create_web_app(runtime, app)
+                client = web.test_client()
+                token = make_tracking_token(cfg, 555)
+
+                with patch.object(type(app.bot), "edit_message_text", new_callable=AsyncMock) as mocked:
+                    response = await client.get(
+                        f"/track/img/2x1/{token}.png",
+                        headers={"user-agent": "Mozilla/5.0 Chrome/123.0", "sec-fetch-mode": "no-cors"},
+                    )
+
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.headers["content-type"], "image/png")
+                    tracked = store.get_tracked_email(555)
+                    self.assertIsNotNone(tracked)
+                    assert tracked is not None
+                    self.assertEqual(tracked.open_count, 1)
+                    self.assertEqual(tracked.last_classification, "human_browser")
                     mocked.assert_awaited_once()
                 store.close()
 

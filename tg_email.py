@@ -33,7 +33,7 @@ from googleapiclient.errors import HttpError
 import google.generativeai as genai
 from hypercorn.asyncio import serve
 from hypercorn.config import Config as HypercornConfig
-from quart import Quart, jsonify, request
+from quart import Quart, Response, jsonify, request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -85,6 +85,12 @@ GMAIL_MONITOR_LABEL_CHOICES = [
     ("IMPORTANT", "Importanti"),
     ("STARRED", "Speciali"),
 ]
+TRANSPARENT_PNG_2X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAC0lEQVR4nGNggAIAAAkAAftSuKkAAAAASUVORK5CYII="
+)
+PIXEL_PROBE_FONT = base64.b64decode(
+    "d09GMgABAAAAAAM0AA4AAAAABjgAAALeAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAG2wcNAZgP1NUQVReADwRDAqBEIEbCwgAATYCJAMMBCAFhGIHIBtIBcgEHnqd+v6X5ACzsYQkAymIUwF5CsyZerm95ZU3Bv/93CoaIt28FKjt7aGfYTaxiIgkUiZk8esLcUdrNBbxbDqIR2ZohQAisTIFddacRavI3NlW7yfTVa/7yPRvbwySiYoYeyEGfHp9kPCIMnxVJOGIhiQeI5FLqpCUFIVYhOh2JHbs/UTKBTbWF5V4qbvFEbQV7ZzmAJEXyMoDnM2Bg+zT58jQMvI3AvnZ+3OXLp3LNPIxm/hPJGfYOSkWxeUGmQnaAIYo46qHo/Ak2fteNbJlV6NblECLy90oyhGexu1+YUdSSiomFCRSlHcIs4H6VimqxZGyHC42pShj10+jxJbho5yMSj3GhLoiTD7mWVKBEnoReozAdmFVm+GhEHEZonyYNwFhQDHQ01FZ9WNRqOaD6A5iRVRbZEecpEUbsaKjNbKjrT2qbW3fs6j9T+i9H7nvofXkwJh9Y7LQBsYQeiR4LJrax+wbU35zU0lK4wTg0Rq13sPbLROmjRsHQxZz/7hx/R2mr0z/tfLs7cuW4a1xk76FZ4WXyiMfE8zBwzcHlym/M/89ibCFNwAdsVs68bMw//9oiFjwO/P/gghbOOZnRTnALvEXZDZHFnn6Lik0E7Y8SHFRGzFci/JqhGAZErEuQbSQLkksX10Kdu65VLK55dIopddlIptdzljGYA4RJURS7CojmnR9uTn6qLqfLwk70cB8GtmOHw87WYuOBxduGlmCQT2Bz8m1QnMXjbhV9Y3U0sAELFgwqEUniBODIME2oNBsQMdcf97FCgx2YPBqDGpYgY6LJvxsp541fLOeBjzw73wcmLFiYzQTyceOFTtjSLj8PfT557KUpcxlYn8HMzsoMnM2Qhv1a4D9v7JhI59VuNH73htJchkdNvCisxPLTKdpnWDepxvIp3zFGBeen6+a2IGZnRgEPmwbGLjwo68l04Cl5Z1ZkJ0jJg2rxe2k4upxhLyX+pAJAA=="
+)
 
 
 class ConfigError(RuntimeError):
@@ -211,8 +217,6 @@ class Config:
             port = int(port_raw)
         except ValueError as exc:
             raise ConfigError("PORT must be integer") from exc
-        if enable_pixel and not pixel_base_url:
-            raise ConfigError("ENABLE_PIXEL=true requires PIXEL_BASE_URL")
         if enable_pixel and not pixel_webhook_secret:
             raise ConfigError("ENABLE_PIXEL=true requires PIXEL_WEBHOOK_SECRET")
         try:
@@ -292,8 +296,6 @@ class Config:
             raise ConfigError("STATE_RETENTION_DAYS must be > 0")
         if not self.gmail_monitor_labels:
             raise ConfigError("GMAIL_MONITOR_LABELS must contain at least one label")
-        if self.enable_pixel and not self.pixel_base_url:
-            raise ConfigError("ENABLE_PIXEL=true requires PIXEL_BASE_URL")
         if self.enable_pixel and not self.pixel_webhook_secret:
             raise ConfigError("ENABLE_PIXEL=true requires PIXEL_WEBHOOK_SECRET")
         if mode == "webhook":
@@ -309,6 +311,9 @@ class Config:
 
     def resolved_public_base_url(self) -> str:
         return self.public_base_url.rstrip("/")
+
+    def resolved_pixel_base_url(self) -> str:
+        return (self.pixel_base_url or self.public_base_url).rstrip("/")
 
     def with_overrides(self, overrides: Mapping[str, str]) -> "Config":
         if not overrides:
@@ -1380,6 +1385,7 @@ def settings_message_text(runtime: Runtime) -> str:
     prompt_preview = ihtml.escape(shorten_text(runtime.config.system_prompt, limit=160))
     public_base_url = ihtml.escape(runtime.config.resolved_public_base_url() or "missing")
     monitor_labels = ihtml.escape(", ".join(runtime.config.gmail_monitor_labels))
+    pixel_base_url = ihtml.escape(runtime.config.resolved_pixel_base_url() or "missing")
     lines = [
         "Impostazioni rapide:",
         "",
@@ -1388,6 +1394,7 @@ def settings_message_text(runtime: Runtime) -> str:
         f"- Gmail token: {'set' if google_token_available(runtime.config) else 'missing'}",
         f"- Cartelle Gmail: {monitor_labels}",
         f"- Pixel: {'enabled' if runtime.config.enable_pixel else 'disabled'}",
+        f"- Pixel URL: {pixel_base_url}",
         f"- Public URL: {public_base_url}",
         "",
         "Prompt di sistema Gemini:",
@@ -1513,6 +1520,233 @@ def verify_dashboard_token(config: Config, token: str | None) -> bool:
 
 def dashboard_url(config: Config) -> str:
     return f"{config.resolved_public_base_url()}/dashboard?token={make_dashboard_token(config)}"
+
+
+def timing_safe_equal(left: str, right: str) -> bool:
+    return hmac.compare_digest(left, right)
+
+
+def parse_tracking_token(config: Config, token: str) -> dict:
+    if not config.pixel_webhook_secret:
+        raise ConfigError("Missing PIXEL_WEBHOOK_SECRET")
+    if "." not in token:
+        raise ConfigError("Malformed pixel token")
+    payload_part, signature_part = token.rsplit(".", 1)
+    expected_signature = b64url_encode(
+        hmac.new(
+            config.pixel_webhook_secret.encode(),
+            payload_part.encode(),
+            hashlib.sha256,
+        ).digest()
+    )
+    if not timing_safe_equal(expected_signature, signature_part):
+        raise ConfigError("Invalid pixel token signature")
+    payload = json.loads(b64url_decode(payload_part))
+    if not isinstance(payload, dict) or not isinstance(payload.get("tg"), int):
+        raise ConfigError("Invalid pixel token payload")
+    return payload
+
+
+def parse_track_request_path(path: str) -> dict | None:
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return None
+    if parts[0] == "pixel":
+        return {"kind": "legacy", "layer": "legacy_img", "dimensions": "legacy", "token": ""}
+    if parts[0] != "track":
+        return None
+    if len(parts) == 3 and parts[1] == "font" and parts[2].endswith(".woff2"):
+        return {
+            "kind": "font",
+            "layer": "font",
+            "dimensions": "font",
+            "token": parts[2][: -len(".woff2")],
+        }
+    if len(parts) != 4 or parts[1] not in {"img", "bg", "dark"} or not parts[3].endswith(".png"):
+        return None
+    return {
+        "kind": "image",
+        "layer": parts[1],
+        "dimensions": parts[2],
+        "token": parts[3][: -len(".png")],
+    }
+
+
+def interesting_request_headers(headers: Mapping[str, str]) -> Dict[str, str]:
+    keys = [
+        "accept",
+        "accept-language",
+        "cf-ipcountry",
+        "cf-ray",
+        "purpose",
+        "sec-purpose",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "user-agent",
+        "x-gmail-fetch-info",
+    ]
+    result: Dict[str, str] = {}
+    for key in keys:
+        value = headers.get(key)
+        if value:
+            result[key] = value
+    return result
+
+
+def classify_pixel_request(
+    headers: Mapping[str, str],
+    *,
+    tg_message_id: int,
+    layer: str,
+    dimensions: str,
+    path: str,
+    pixel_id: str,
+) -> Dict[str, Any]:
+    user_agent = headers.get("user-agent")
+    gmail_fetch_info = headers.get("x-gmail-fetch-info")
+    ua = (user_agent or "").lower()
+    gmail_info = (gmail_fetch_info or "").lower()
+    purpose = (headers.get("purpose") or headers.get("sec-purpose") or "").lower()
+    accept = (headers.get("accept") or "").lower()
+    sec_fetch_dest = (headers.get("sec-fetch-dest") or "").lower()
+    has_browser_fetch_headers = any(
+        headers.get(header)
+        for header in ("sec-fetch-mode", "sec-fetch-site", "sec-fetch-dest")
+    )
+
+    classification = "unknown_proxy"
+    confidence = 0.45
+    is_user_open = False
+    if "googleimageproxy" in ua or gmail_info:
+        classification = "gmail_proxy"
+        confidence = 0.98
+    elif "prefetch" in purpose:
+        classification = "prefetch_proxy"
+        confidence = 0.9
+    elif layer == "font" or sec_fetch_dest == "font" or "font" in accept:
+        classification = "font_loader"
+        confidence = 0.85
+    elif has_browser_fetch_headers or any(browser in ua for browser in ("chrome", "firefox", "safari", "edg/")):
+        classification = "human_browser"
+        confidence = 0.82
+        is_user_open = True
+
+    return {
+        "tg_msg_id": tg_message_id,
+        "layer": layer,
+        "dimensions": dimensions,
+        "classification": classification,
+        "confidence": confidence,
+        "is_user_open": is_user_open,
+        "pixel_id": pixel_id,
+        "ip": headers.get("cf-connecting-ip") or headers.get("x-forwarded-for"),
+        "user_agent": user_agent,
+        "gmail_fetch_info": gmail_fetch_info,
+        "headers": interesting_request_headers(headers),
+        "path": path,
+        "received_at": utcnow_iso(),
+    }
+
+
+def pixel_asset_response(kind: str) -> Response:
+    if kind == "font":
+        return Response(
+            PIXEL_PROBE_FONT,
+            headers={
+                "content-type": "font/woff2",
+                "cache-control": "no-store, max-age=0",
+                "vary": "user-agent",
+            },
+        )
+    return Response(
+        TRANSPARENT_PNG_2X1,
+        headers={
+            "content-type": "image/png",
+            "cache-control": "no-store, max-age=0",
+            "vary": "user-agent",
+        },
+    )
+
+
+async def apply_pixel_event(runtime: Runtime, application: Application, event: Mapping[str, Any]) -> None:
+    tg_message_id = int(event.get("tg_msg_id") or 0)
+    if not tg_message_id:
+        raise ConfigError("tg_msg_id missing")
+
+    confidence = event.get("confidence")
+    try:
+        confidence_value = float(confidence) if confidence not in (None, "") else None
+    except (TypeError, ValueError):
+        confidence_value = None
+
+    is_user_open = event.get("is_user_open")
+    if is_user_open is None:
+        is_user_open_value = None
+    elif isinstance(is_user_open, bool):
+        is_user_open_value = is_user_open
+    else:
+        is_user_open_value = parse_bool(str(is_user_open), default=False)
+
+    original = runtime.store.get_email_state(tg_message_id)
+    email_subject = event.get("email_subject") or ""
+    tracked = runtime.store.record_pixel_event(
+        tg_message_id=tg_message_id,
+        classification=str(event.get("classification") or ""),
+        layer=str(event.get("layer") or "img"),
+        dimensions=str(event.get("dimensions") or ""),
+        confidence=confidence_value,
+        is_user_open=is_user_open_value,
+        email_subject=email_subject,
+    )
+    if not email_subject:
+        if original:
+            email_subject = original.subject
+        elif tracked:
+            email_subject = tracked.subject
+
+    if original:
+        classification = str(event.get("classification") or "")
+        layer = str(event.get("layer") or "img")
+        dimensions = str(event.get("dimensions") or "")
+        if classification:
+            icon = "✅" if classification == "human_browser" else "⚠️"
+            confidence_text = f", conf {confidence_value}" if confidence_value is not None else ""
+            status_text = f"{icon} {classification.replace('_', ' ')} via {layer}"
+            if dimensions:
+                status_text += f" ({dimensions}{confidence_text})"
+        else:
+            status_icon = "✅" if is_user_open_value else "❌"
+            status_text = f"{status_icon} opened by user" if is_user_open_value else "❌ opened by proxy"
+        text = format_email_text(
+            original,
+            status_line=f"{status_text} {f'[{email_subject}]' if email_subject else ''}".strip(),
+        )
+    elif tracked:
+        note = email_subject or "Evento pixel ricevuto."
+        text = format_tracked_email_text(tracked, note=note)
+    else:
+        fallback = EmailState(
+            tg_message_id=tg_message_id,
+            gmail_message_id="",
+            gmail_thread_id="",
+            sender="",
+            subject=email_subject or "Tracked email",
+            body="Original text unavailable",
+            header="",
+            attachments=[],
+            starred=False,
+            lang="it",
+        )
+        text = format_email_text(fallback)
+
+    await application.bot.edit_message_text(
+        chat_id=runtime.config.chat_id,
+        message_id=tg_message_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
 def apply_runtime_overrides(runtime: Runtime) -> None:
@@ -1868,9 +2102,9 @@ def normalize_bot_config_key(raw: str) -> str:
 
 
 def build_tracking_markup_for_message_id(config: Config, tg_message_id: int) -> str:
-    if not (config.enable_pixel and config.pixel_base_url):
+    if not config.enable_pixel:
         return ""
-    base_url = config.pixel_base_url
+    base_url = config.resolved_pixel_base_url()
     token = make_tracking_token(config, tg_message_id)
     nonce = uuid4().hex[:10]
     img_url = f"{base_url}/track/img/2x1/{token}.png"
@@ -1936,7 +2170,7 @@ EDITABLE_DASHBOARD_FIELDS = [
         attr="pixel_base_url",
         label="Pixel base URL",
         kind="text",
-        help_text="Cloudflare Worker or other tracking endpoint base URL.",
+        help_text="Optional external tracking endpoint base URL. Leave blank to use this Fly app directly.",
     ),
     DashboardField(
         key="PIXEL_WEBHOOK_SECRET",
@@ -2057,6 +2291,10 @@ def field_display_value(field: DashboardField, value: Any) -> str:
         return "enabled" if bool(value) else "disabled"
     if field.secret:
         return "set" if value else "missing"
+    if field.key == "PIXEL_BASE_URL":
+        if value:
+            return shorten_text(str(value))
+        return "self-hosted (PUBLIC_BASE_URL)"
     if field.key in {"PREDEF_FWD", "GMAIL_MONITOR_LABELS"}:
         if isinstance(value, list):
             if not value:
@@ -2722,9 +2960,9 @@ async def begin_tracked_email_flow(
     context: ContextTypes.DEFAULT_TYPE,
     runtime: Runtime,
 ) -> None:
-    if not runtime.config.enable_pixel or not runtime.config.pixel_base_url:
+    if not runtime.config.enable_pixel or not runtime.config.resolved_pixel_base_url():
         await message.reply_text(
-            "Il pixel non è configurato. Apri Impostazioni o /dashboard e completa Pixel URL + secret prima di creare email tracciate."
+            "Il pixel non è configurato. Apri Impostazioni o /dashboard e completa almeno Pixel ON + secret prima di creare email tracciate."
         )
         return
     await prompt_for_setup_value(
@@ -3063,7 +3301,7 @@ async def handle_settings_callback(
         await prompt_for_setup_value(
             context,
             runtime,
-            prompt_text="Rispondi con la `PIXEL_BASE_URL`, ad esempio il tuo Worker/endpoint pubblico.",
+            prompt_text="Rispondi con la `PIXEL_BASE_URL` se vuoi usare un endpoint esterno. Se la lasci vuota, il pixel usera' direttamente questo deploy Fly.",
             action_kind="setup_pixel_base_url",
             reply_to_message_id=query.message.message_id,
         )
@@ -3163,10 +3401,11 @@ async def txt_followup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await send_setup_message(message, runtime, "Public base URL salvata.")
                 return
             if interactive.action_kind == "setup_pixel_base_url":
-                if not raw_text:
-                    raise ConfigError("Serve una PIXEL_BASE_URL testuale.")
                 save_runtime_settings(runtime, {"PIXEL_BASE_URL": raw_text})
-                await send_settings_message(message, runtime, "Pixel base URL salvata.")
+                if raw_text:
+                    await send_settings_message(message, runtime, "Pixel base URL salvata.")
+                else:
+                    await send_settings_message(message, runtime, "Pixel base URL rimossa. Ora il pixel usa direttamente questo deploy Fly.")
                 return
             if interactive.action_kind == "setup_pixel_webhook_secret":
                 if not raw_text:
@@ -3691,85 +3930,48 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
                 500,
             )
 
+    @app.get("/pixel")
+    @app.get("/track/<layer>/<dimensions>/<filename>")
+    @app.get("/track/font/<filename>")
+    async def pixel_asset(layer: str | None = None, dimensions: str | None = None, filename: str | None = None):
+        track_request = parse_track_request_path(request.path)
+        if not track_request:
+            return "Not Found", 404
+        try:
+            if track_request["kind"] == "legacy":
+                tg_message_id = int(request.args.get("tg_msg_id", "0") or "0")
+                pixel_id = request.args.get("id") or uuid4().hex
+            else:
+                payload = parse_tracking_token(runtime.config, track_request["token"])
+                tg_message_id = int(payload["tg"])
+                pixel_id = track_request["token"]
+            event = classify_pixel_request(
+                request.headers,
+                tg_message_id=tg_message_id,
+                layer=track_request["layer"],
+                dimensions=track_request["dimensions"],
+                path=request.path,
+                pixel_id=pixel_id,
+            )
+            await apply_pixel_event(runtime, application, event)
+        except ConfigError:
+            LOGGER.exception("Pixel asset request rejected.")
+            return "Not Found", 404
+        except Exception:
+            LOGGER.exception("Self-hosted pixel handling failed.")
+        return pixel_asset_response(track_request["kind"])
+
     @app.post("/pixel_status")
     async def pixel_status():
         if request.headers.get("X-Pixel-Secret") != runtime.config.pixel_webhook_secret:
             return jsonify({"status": "unauthorized"}), 401
 
         data = await request.get_json(silent=True) or {}
-        tg_message_id = data.get("tg_msg_id")
-        is_user_open = data.get("is_user_open")
-        email_subject = data.get("email_subject") or ""
-        classification = data.get("classification") or ""
-        layer = data.get("layer") or "img"
-        dimensions = data.get("dimensions") or ""
-        confidence = data.get("confidence")
         try:
-            confidence_value = float(confidence) if confidence not in (None, "") else None
-        except (TypeError, ValueError):
-            confidence_value = None
-        is_user_open_value: bool | None
-        if is_user_open is None:
-            is_user_open_value = None
-        elif isinstance(is_user_open, bool):
-            is_user_open_value = is_user_open
-        else:
-            is_user_open_value = parse_bool(str(is_user_open), default=False)
-
-        if not tg_message_id:
-            return jsonify({"status": "error", "message": "tg_msg_id missing"}), 400
-
-        original = runtime.store.get_email_state(int(tg_message_id))
-        tracked = runtime.store.record_pixel_event(
-            tg_message_id=int(tg_message_id),
-            classification=classification,
-            layer=layer,
-            dimensions=dimensions,
-            confidence=confidence_value,
-            is_user_open=is_user_open_value,
-            email_subject=email_subject,
-        )
-        if original:
-            if classification:
-                icon = "✅" if classification == "human_browser" else "⚠️"
-                confidence_text = f", conf {confidence}" if confidence is not None else ""
-                status_text = f"{icon} {classification.replace('_', ' ')} via {layer}"
-                if dimensions:
-                    status_text += f" ({dimensions}{confidence_text})"
-            else:
-                status_icon = "✅" if is_user_open else "❌"
-                status_text = f"{status_icon} opened by user" if is_user_open else "❌ opened by proxy"
-            text = format_email_text(
-                original,
-                status_line=f"{status_text} {f'[{email_subject}]' if email_subject else ''}".strip(),
-            )
-        elif tracked:
-            note = email_subject or "Evento pixel ricevuto."
-            text = format_tracked_email_text(tracked, note=note)
-        else:
-            fallback = EmailState(
-                tg_message_id=int(tg_message_id),
-                gmail_message_id="",
-                gmail_thread_id="",
-                sender="",
-                subject=email_subject or "Tracked email",
-                body="Original text unavailable",
-                header="",
-                attachments=[],
-                starred=False,
-                lang="it",
-            )
-            text = format_email_text(fallback)
-
-        try:
-            await application.bot.edit_message_text(
-                chat_id=runtime.config.chat_id,
-                message_id=int(tg_message_id),
-                text=text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+            await apply_pixel_event(runtime, application, data)
             return jsonify({"status": "success"}), 200
+        except ConfigError as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 400
         except Exception as exc:
             LOGGER.exception("Pixel webhook update failed.")
             return jsonify({"status": "error", "message": str(exc)}), 500
