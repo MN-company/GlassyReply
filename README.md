@@ -11,7 +11,7 @@ It watches Gmail, forwards each new inbox message to Telegram, streams a Gemini 
                 |      Gmail API       |
                 +----------+-----------+
                            |
-                    poll + actions
+          push wake-up + polling fallback + actions
                            |
 +-------------+     +-----v-------------------+      +------------------+
 | Telegram App | <-> | GlassyReply Python bot | <--> | Gemini API       |
@@ -91,6 +91,8 @@ Optional runtime values:
 - `ENABLE_PIXEL=true`
 - `PIXEL_WEBHOOK_SECRET=shared-secret`
 - `PIXEL_BASE_URL=https://another-host.example.com` only if you want an external tracker instead of the built-in Fly routes
+- `GMAIL_PUSH_TOPIC=projects/my-project/topics/glassyreply-mail`
+- `GMAIL_PUSH_WEBHOOK_SECRET=a-random-secret-used-in-the-push-url`
 - `TIMEZONE=Europe/Rome`
 - `TELEGRAM_WEBHOOK_URL=https://your-public-host`
 - `TELEGRAM_WEBHOOK_SECRET=telegram-secret`
@@ -224,6 +226,8 @@ Optional bootstrap secrets you can add now or later from the bot:
 - `GOOGLE_API_KEY`
 - `GOOGLE_OAUTH_CREDENTIALS_JSON`
 - `GOOGLE_OAUTH_TOKEN_JSON`
+- `GMAIL_PUSH_TOPIC`
+- `GMAIL_PUSH_WEBHOOK_SECRET`
 - pixel-related secrets
 
 You can leave most runtime knobs for `/setup`, `/set`, or the dashboard after the app is live.
@@ -252,7 +256,43 @@ flyctl deploy --app glassyreply-bot
 
 On first boot, the container writes the token into `/app/data/token.json`. After that, restarts preserve both `state.db` and the refreshed token on the volume.
 
-### 4. Health check
+### 4. Wake on mail with Fly autosleep
+
+`auto_stop_machines = "suspend"` is only useful for Gmail if the mailbox can wake the app with an inbound HTTP request.
+
+GlassyReply now supports that through Gmail Push:
+
+1. Create a Pub/Sub topic in the same Google Cloud project used by the Gmail OAuth client.
+2. Grant Gmail publish access to the topic.
+   Use the Gmail publisher service account: `gmail-api-push@system.gserviceaccount.com`.
+3. Save `GMAIL_PUSH_TOPIC` in the bot settings or dashboard.
+4. Save `GMAIL_PUSH_WEBHOOK_SECRET` in the bot settings or dashboard.
+5. Create a Pub/Sub push subscription that points to:
+
+```text
+https://your-fly-app.fly.dev/gmail/push?secret=YOUR_SECRET
+```
+
+For the default Fly app name in this repo, that becomes:
+
+```text
+https://glassyreply-bot.fly.dev/gmail/push?secret=YOUR_SECRET
+```
+
+Recommended topic example:
+
+```text
+projects/my-project/topics/glassyreply-mail
+```
+
+Notes:
+
+- Gmail `users.watch` is renewed automatically by the bot while it is awake.
+- Gmail history IDs are used to recover the exact new messages instead of trusting the webhook payload alone.
+- If Gmail Push is not configured, the bot falls back to polling, so Fly suspend will not wake it on new mail.
+- Gmail history IDs are usually valid for about a week, so if the app stays completely idle for many days, refresh the watch from Telegram settings before relying on autosleep again.
+
+### 5. Health check
 
 Fly checks:
 
@@ -402,6 +442,7 @@ playwright screenshot -b chromium \
 
 - Only the configured Telegram owner can use bot handlers.
 - `PIXEL_WEBHOOK_SECRET` is checked before parsing pixel webhook JSON.
+- `GMAIL_PUSH_WEBHOOK_SECRET` is checked before parsing Gmail Pub/Sub JSON.
 - Pixel tokens are signed.
 - The same Fly app can now serve the signed tracking assets directly.
 - Gmail state and pending Telegram follow-ups persist in SQLite.

@@ -14,6 +14,7 @@ from googleapiclient.errors import HttpError
 
 from tg_email import (
     GMAIL_INITIAL_SYNC_KEY,
+    GMAIL_HISTORY_ID_KEY,
     GOOGLE_OAUTH_STATE_KEY,
     Runtime,
     Config,
@@ -140,6 +141,22 @@ class ConfigTests(unittest.TestCase):
                     "TIMEZONE": "Mars/Olympus",
                 }
             )
+
+    def test_gmail_push_fields_are_loaded_from_env(self) -> None:
+        cfg = Config.from_env(
+            {
+                "TELEGRAM_BOT_TOKEN": "token",
+                "PUBLIC_BASE_URL": "https://glassyreply-bot.fly.dev",
+                "GMAIL_PUSH_TOPIC": "projects/demo/topics/glassyreply-mail",
+                "GMAIL_PUSH_WEBHOOK_SECRET": "push-secret",
+            }
+        )
+        self.assertEqual(cfg.gmail_push_topic, "projects/demo/topics/glassyreply-mail")
+        self.assertEqual(cfg.gmail_push_webhook_secret, "push-secret")
+        self.assertEqual(
+            cfg.resolved_gmail_push_url(),
+            "https://glassyreply-bot.fly.dev/gmail/push?secret=push-secret",
+        )
 
 
 class AssistantUxTests(unittest.TestCase):
@@ -1001,6 +1018,118 @@ class WebAppSmokeTests(unittest.TestCase):
                     self.assertEqual(tracked.open_count, 1)
                     mocked.assert_awaited_once()
                 store.close()
+
+        asyncio.run(run())
+
+    def test_gmail_push_route_rejects_wrong_secret(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cfg = Config.from_env(
+                    {
+                        "TELEGRAM_BOT_TOKEN": "token",
+                        "TELEGRAM_CHAT_ID": "123",
+                        "PUBLIC_BASE_URL": "https://glassyreply-bot.fly.dev",
+                        "GMAIL_PUSH_TOPIC": "projects/demo/topics/glassyreply-mail",
+                        "GMAIL_PUSH_WEBHOOK_SECRET": "push-secret",
+                        "GOOGLE_OAUTH_CREDENTIALS_JSON": '{"web":{"client_id":"x","project_id":"p","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","client_secret":"secret"}}',
+                        "GOOGLE_OAUTH_TOKEN_JSON": '{"refresh_token":"refresh","client_id":"client","client_secret":"secret","token_uri":"https://oauth2.googleapis.com/token"}',
+                        "DATA_DIR": tmpdir,
+                    }
+                )
+                store = StateStore(Path(tmpdir) / "state.db")
+                runtime = Runtime(
+                    base_config=cfg,
+                    config=cfg,
+                    startup_overrides={},
+                    store=store,
+                    gmail=SimpleNamespace(config=cfg, invalidate=lambda: None),
+                    model=None,
+                    shutdown_event=asyncio.Event(),
+                    mode="polling",
+                )
+                app = build_application(runtime)
+                web = create_web_app(runtime, app)
+                client = web.test_client()
+                try:
+                    response = await client.post("/gmail/push?secret=wrong", json={})
+                    self.assertEqual(response.status_code, 401)
+                finally:
+                    store.close()
+
+        asyncio.run(run())
+
+    def test_gmail_push_route_processes_history_notifications(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cfg = Config.from_env(
+                    {
+                        "TELEGRAM_BOT_TOKEN": "token",
+                        "TELEGRAM_CHAT_ID": "123",
+                        "PUBLIC_BASE_URL": "https://glassyreply-bot.fly.dev",
+                        "GMAIL_PUSH_TOPIC": "projects/demo/topics/glassyreply-mail",
+                        "GMAIL_PUSH_WEBHOOK_SECRET": "push-secret",
+                        "GOOGLE_OAUTH_CREDENTIALS_JSON": '{"web":{"client_id":"x","project_id":"p","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","client_secret":"secret"}}',
+                        "GOOGLE_OAUTH_TOKEN_JSON": '{"refresh_token":"refresh","client_id":"client","client_secret":"secret","token_uri":"https://oauth2.googleapis.com/token"}',
+                        "DATA_DIR": tmpdir,
+                    }
+                )
+                store = StateStore(Path(tmpdir) / "state.db")
+                runtime = Runtime(
+                    base_config=cfg,
+                    config=cfg,
+                    startup_overrides={},
+                    store=store,
+                    gmail=SimpleNamespace(
+                        config=cfg,
+                        invalidate=lambda: None,
+                        list_history=lambda start_history_id, **kwargs: {
+                            "history": [
+                                {
+                                    "id": "101",
+                                    "messagesAdded": [{"message": {"id": "gmail-2", "threadId": "thread-2"}}],
+                                }
+                            ],
+                            "historyId": "102",
+                        },
+                        get_full_message=lambda gmail_message_id: {
+                            "id": gmail_message_id,
+                            "threadId": "thread-2",
+                            "labelIds": ["INBOX"],
+                            "payload": {"headers": [], "parts": [], "body": {}},
+                        },
+                    ),
+                    model=None,
+                    shutdown_event=asyncio.Event(),
+                    mode="polling",
+                )
+                store.set_bot_state(GMAIL_HISTORY_ID_KEY, "100")
+                app = build_application(runtime)
+                web = create_web_app(runtime, app)
+                client = web.test_client()
+                pubsub_body = {
+                    "message": {
+                        "data": base64.urlsafe_b64encode(
+                            json.dumps(
+                                {"emailAddress": "owner@example.com", "historyId": "102"}
+                            ).encode()
+                        ).decode()
+                    }
+                }
+                try:
+                    with patch("tg_email.process_new_email", new_callable=AsyncMock) as mocked:
+                        response = await client.post(
+                            "/gmail/push?secret=push-secret",
+                            json=pubsub_body,
+                        )
+                    self.assertEqual(response.status_code, 200)
+                    body = await response.get_json()
+                    self.assertEqual(body["status"], "ok")
+                    self.assertEqual(body["processed"], 1)
+                    self.assertEqual(store.get_bot_state(GMAIL_HISTORY_ID_KEY), "102")
+                    mocked.assert_awaited_once()
+                    self.assertEqual(mocked.await_args.args[2], "gmail-2")
+                finally:
+                    store.close()
 
         asyncio.run(run())
 

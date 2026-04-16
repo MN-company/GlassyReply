@@ -15,6 +15,7 @@ import re
 import signal
 import sqlite3
 import threading
+from urllib.parse import quote
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header
@@ -63,6 +64,8 @@ TELEGRAM_MAX = 4_000
 PAGE_SIZE = 30
 STATE_RETENTION_DAYS = 30
 LAST_SEEN_KEY = "last_seen_gmail_message_id"
+GMAIL_HISTORY_ID_KEY = "gmail_history_id"
+GMAIL_WATCH_EXPIRATION_KEY = "gmail_watch_expiration"
 GOOGLE_OAUTH_STATE_KEY = "google_oauth_pending_state"
 GMAIL_INITIAL_SYNC_KEY = "gmail_initial_sync_pending"
 PREDEF_FWD = ["redazione@example.com", "boss@example.com"]
@@ -74,6 +77,8 @@ DEFAULT_PROMPT = (
 DASHBOARD_TOKEN_TTL_SECONDS = 24 * 60 * 60
 TRACKED_DRAFT_RECIPIENT_KEY = "tracked_draft_recipient"
 TRACKED_DRAFT_SUBJECT_KEY = "tracked_draft_subject"
+GMAIL_PUSH_RENEW_MARGIN_SECONDS = 24 * 60 * 60
+GMAIL_PUSH_LOOP_INTERVAL_SECONDS = 60
 MENU_TRACKED_EMAIL = "Email Tracciata"
 MENU_STATS = "Stats"
 MENU_SETTINGS = "Impostazioni"
@@ -200,6 +205,18 @@ def parse_iso_datetime(value: str | None) -> datetime | None:
     return parsed
 
 
+def parse_epoch_millis(value: str | None) -> int | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def format_count_it(value: int, singular: str, plural: str) -> str:
     return f"{value} {singular if value == 1 else plural}"
 
@@ -314,6 +331,8 @@ class Config:
     state_retention_days: int
     telegram_webhook_url: str
     telegram_webhook_secret: str
+    gmail_push_topic: str
+    gmail_push_webhook_secret: str
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Config":
@@ -361,6 +380,8 @@ class Config:
         state_retention_days_raw = source.get("STATE_RETENTION_DAYS", str(STATE_RETENTION_DAYS)).strip()
         telegram_webhook_url = source.get("TELEGRAM_WEBHOOK_URL", "").strip()
         telegram_webhook_secret = source.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+        gmail_push_topic = source.get("GMAIL_PUSH_TOPIC", "").strip()
+        gmail_push_webhook_secret = source.get("GMAIL_PUSH_WEBHOOK_SECRET", "").strip()
 
         if not bot_token:
             raise ConfigError("Missing TELEGRAM_BOT_TOKEN")
@@ -407,6 +428,8 @@ class Config:
             state_retention_days=state_retention_days,
             telegram_webhook_url=telegram_webhook_url,
             telegram_webhook_secret=telegram_webhook_secret,
+            gmail_push_topic=gmail_push_topic,
+            gmail_push_webhook_secret=gmail_push_webhook_secret,
         )
 
     def ensure_storage(self) -> None:
@@ -498,6 +521,8 @@ class Config:
             "google_oauth_token_json": self.google_oauth_token_json,
             "telegram_webhook_url": self.telegram_webhook_url,
             "telegram_webhook_secret": self.telegram_webhook_secret,
+            "gmail_push_topic": self.gmail_push_topic,
+            "gmail_push_webhook_secret": self.gmail_push_webhook_secret,
         }
 
         if "TELEGRAM_CHAT_ID" in overrides:
@@ -546,8 +571,18 @@ class Config:
             data["telegram_webhook_url"] = overrides["TELEGRAM_WEBHOOK_URL"].strip()
         if "TELEGRAM_WEBHOOK_SECRET" in overrides:
             data["telegram_webhook_secret"] = overrides["TELEGRAM_WEBHOOK_SECRET"].strip()
+        if "GMAIL_PUSH_TOPIC" in overrides:
+            data["gmail_push_topic"] = overrides["GMAIL_PUSH_TOPIC"].strip()
+        if "GMAIL_PUSH_WEBHOOK_SECRET" in overrides:
+            data["gmail_push_webhook_secret"] = overrides["GMAIL_PUSH_WEBHOOK_SECRET"].strip()
 
         return replace(self, **data)
+
+    def resolved_gmail_push_url(self) -> str:
+        base = self.resolved_public_base_url().rstrip("/") + "/gmail/push"
+        if not self.gmail_push_webhook_secret:
+            return base
+        return f"{base}?secret={quote(self.gmail_push_webhook_secret, safe='')}"
 
 
 @dataclass(slots=True)
@@ -1427,6 +1462,55 @@ class GmailClient:
             .execute()
         )
 
+    def watch_mailbox(self, topic_name: str, label_ids: List[str]) -> dict:
+        body: Dict[str, Any] = {"topicName": topic_name}
+        labels = [label for label in label_ids if label]
+        if labels:
+            body["labelIds"] = labels
+            body["labelFilterBehavior"] = "include"
+        return self.call(
+            lambda svc: svc.users()
+            .watch(userId="me", body=body)
+            .execute()
+        )
+
+    def list_history(
+        self,
+        start_history_id: str,
+        *,
+        label_ids: List[str] | None = None,
+        history_types: List[str] | None = None,
+    ) -> dict:
+        def fetch(service: Any) -> dict:
+            items: List[dict] = []
+            page_token: str | None = None
+            current_history_id = start_history_id
+            single_label = ""
+            labels = [label for label in (label_ids or []) if label]
+            if len(labels) == 1:
+                single_label = labels[0]
+            while True:
+                kwargs: Dict[str, Any] = {
+                    "userId": "me",
+                    "startHistoryId": str(start_history_id),
+                    "maxResults": 500,
+                }
+                if page_token:
+                    kwargs["pageToken"] = page_token
+                if history_types:
+                    kwargs["historyTypes"] = history_types
+                if single_label:
+                    kwargs["labelId"] = single_label
+                payload = service.users().history().list(**kwargs).execute()
+                items.extend(payload.get("history") or [])
+                current_history_id = str(payload.get("historyId") or current_history_id)
+                page_token = payload.get("nextPageToken")
+                if not page_token:
+                    break
+            return {"history": items, "historyId": current_history_id}
+
+        return self.call(fetch)
+
 
 @dataclass(slots=True)
 class Runtime:
@@ -1438,6 +1522,7 @@ class Runtime:
     model: Any
     shutdown_event: asyncio.Event
     mode: str
+    gmail_push_lock: asyncio.Lock | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1838,12 +1923,23 @@ def settings_message_text(runtime: Runtime) -> str:
     monitor_labels = ihtml.escape(", ".join(runtime.config.gmail_monitor_labels))
     pixel_base_url = ihtml.escape(runtime.config.resolved_pixel_base_url() or "missing")
     timezone_label = ihtml.escape(runtime.config.resolved_timezone_name())
+    if gmail_push_ready(runtime.config):
+        gmail_push_status = "enabled"
+    elif runtime.config.gmail_push_topic or runtime.config.gmail_push_webhook_secret:
+        gmail_push_status = "partial"
+    else:
+        gmail_push_status = "polling fallback"
+    gmail_push_topic = ihtml.escape(shorten_text(runtime.config.gmail_push_topic or "missing", limit=120))
+    gmail_push_url = ihtml.escape(shorten_text(runtime.config.resolved_gmail_push_url(), limit=160))
     lines = [
         "Impostazioni rapide:",
         "",
         f"- Gemini key: {'set' if ai_configured(runtime.config) else 'missing'}",
         f"- Gmail OAuth: {'set' if google_credentials_available(runtime.config) else 'missing'}",
         f"- Gmail token: {'set' if google_token_available(runtime.config) else 'missing'}",
+        f"- Gmail push wake-up: {gmail_push_status}",
+        f"- Gmail push topic: {gmail_push_topic}",
+        f"- Gmail push URL: {gmail_push_url}",
         f"- Cartelle Gmail: {monitor_labels}",
         f"- Timezone: {timezone_label}",
         f"- Pixel: {'enabled' if runtime.config.enable_pixel else 'disabled'}",
@@ -2349,6 +2445,18 @@ def gmail_ready_for_watch(config: Config) -> bool:
     return owner_configured(config) and google_credentials_available(config) and google_token_available(config)
 
 
+def gmail_push_configured(config: Config) -> bool:
+    return bool(
+        config.gmail_push_topic
+        and config.gmail_push_webhook_secret
+        and public_base_url_ready(config)
+    )
+
+
+def gmail_push_ready(config: Config) -> bool:
+    return gmail_ready_for_watch(config) and gmail_push_configured(config)
+
+
 def google_oauth_redirect_url(config: Config) -> str:
     return config.resolved_public_base_url() + "/oauth/google/callback"
 
@@ -2389,12 +2497,19 @@ def setup_status_lines(runtime: Runtime) -> List[str]:
         if owner_configured(config)
         else "Owner Telegram ID: not claimed yet"
     )
+    if gmail_push_ready(config):
+        gmail_push_line = "Gmail push wake-up: enabled"
+    elif config.gmail_push_topic or config.gmail_push_webhook_secret:
+        gmail_push_line = "Gmail push wake-up: partial config, using polling fallback"
+    else:
+        gmail_push_line = "Gmail push wake-up: disabled, using polling fallback"
     return [
         owner_line,
         f"Gemini API key: {'set' if ai_configured(config) else 'missing'}",
         f"Public base URL: {config.resolved_public_base_url() or 'missing'}",
         f"Google OAuth client JSON: {'set' if google_credentials_available(config) else 'missing'}",
         f"Gmail refresh token: {'set' if google_token_available(config) else 'missing'}",
+        gmail_push_line,
         f"Gmail monitor labels: {', '.join(config.gmail_monitor_labels)}",
         f"Timezone: {config.resolved_timezone_name()}",
         f"Pixel tracking: {'enabled' if config.enable_pixel else 'disabled'}",
@@ -2427,10 +2542,17 @@ def settings_keyboard(runtime: Runtime) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("OAuth JSON", callback_data="settings|oauth_json"),
-            InlineKeyboardButton("Pixel URL", callback_data="settings|pixel_base_url"),
+            InlineKeyboardButton("Push topic", callback_data="settings|gmail_push_topic"),
         ],
         [
+            InlineKeyboardButton("Push secret", callback_data="settings|gmail_push_secret"),
+            InlineKeyboardButton("Refresh push", callback_data="settings|gmail_push_refresh"),
+        ],
+        [
+            InlineKeyboardButton("Pixel URL", callback_data="settings|pixel_base_url"),
             InlineKeyboardButton("Pixel secret", callback_data="settings|pixel_webhook_secret"),
+        ],
+        [
             InlineKeyboardButton("Pixel ON/OFF", callback_data="settings|toggle_pixel"),
         ],
         [
@@ -2561,6 +2683,16 @@ def save_runtime_settings(runtime: Runtime, updates: Mapping[str, str]) -> None:
     apply_runtime_overrides(runtime)
     if "GMAIL_MONITOR_LABELS" in updates:
         mark_gmail_initial_sync_pending(runtime)
+    if {
+        "PUBLIC_BASE_URL",
+        "GOOGLE_OAUTH_CREDENTIALS_JSON",
+        "GOOGLE_OAUTH_TOKEN_JSON",
+        "GMAIL_PUSH_TOPIC",
+        "GMAIL_PUSH_WEBHOOK_SECRET",
+        "GMAIL_MONITOR_LABELS",
+    } & set(updates):
+        runtime.store.set_bot_state(GMAIL_HISTORY_ID_KEY, "")
+        runtime.store.set_bot_state(GMAIL_WATCH_EXPIRATION_KEY, "")
 
 
 def claim_owner(runtime: Runtime, user_id: int) -> None:
@@ -2636,6 +2768,8 @@ BOT_CONFIG_ALIASES = {
     "state_retention_days": "STATE_RETENTION_DAYS",
     "telegram_webhook_url": "TELEGRAM_WEBHOOK_URL",
     "telegram_webhook_secret": "TELEGRAM_WEBHOOK_SECRET",
+    "gmail_push_topic": "GMAIL_PUSH_TOPIC",
+    "gmail_push_webhook_secret": "GMAIL_PUSH_WEBHOOK_SECRET",
     "google_oauth_credentials_json": "GOOGLE_OAUTH_CREDENTIALS_JSON",
     "google_oauth_token_json": "GOOGLE_OAUTH_TOKEN_JSON",
 }
@@ -2706,6 +2840,158 @@ def split_unseen_inbox_ids(recent_ids: List[str], last_seen: str | None) -> tupl
     return list(reversed(recent_ids[:index])), newest_seen
 
 
+def gmail_push_secret_matches(config: Config, candidate: str | None) -> bool:
+    if not config.gmail_push_webhook_secret:
+        return False
+    if not candidate:
+        return False
+    return timing_safe_equal(config.gmail_push_webhook_secret, candidate)
+
+
+def gmail_push_expiration_ms(runtime: Runtime) -> int | None:
+    return parse_epoch_millis(runtime.store.get_bot_state(GMAIL_WATCH_EXPIRATION_KEY))
+
+
+def gmail_push_should_renew(runtime: Runtime) -> bool:
+    expiration_ms = gmail_push_expiration_ms(runtime)
+    if expiration_ms is None:
+        return True
+    now_ms = int(utcnow().timestamp() * 1000)
+    return expiration_ms - now_ms <= GMAIL_PUSH_RENEW_MARGIN_SECONDS * 1000
+
+
+def decode_pubsub_push_payload(raw_body: Mapping[str, Any]) -> dict:
+    message = raw_body.get("message")
+    if not isinstance(message, Mapping):
+        raise ConfigError("Pub/Sub payload missing message object")
+    encoded = str(message.get("data") or "").strip()
+    if not encoded:
+        raise ConfigError("Pub/Sub payload missing message.data")
+    payload = json.loads(b64url_decode(encoded))
+    if not isinstance(payload, dict) or not payload.get("historyId"):
+        raise ConfigError("Pub/Sub Gmail payload missing historyId")
+    return payload
+
+
+def extract_history_message_ids(history_rows: List[dict]) -> List[str]:
+    message_ids: List[str] = []
+    seen: set[str] = set()
+    for row in history_rows:
+        for item in row.get("messagesAdded") or []:
+            message = item.get("message") or {}
+            message_id = str(message.get("id") or "").strip()
+            if message_id and message_id not in seen:
+                seen.add(message_id)
+                message_ids.append(message_id)
+    return message_ids
+
+
+def message_matches_monitored_labels(payload: dict, label_ids: List[str]) -> bool:
+    labels = set(payload.get("labelIds") or [])
+    monitored = {label for label in label_ids if label} or {"INBOX"}
+    return bool(labels & monitored)
+
+
+def runtime_gmail_push_lock(runtime: Runtime) -> asyncio.Lock:
+    lock = runtime.gmail_push_lock
+    if lock is None:
+        lock = asyncio.Lock()
+        runtime.gmail_push_lock = lock
+    return lock
+
+
+async def ensure_gmail_push_watch(
+    runtime: Runtime,
+    *,
+    reset_history_id: bool = False,
+) -> dict | None:
+    if not gmail_push_ready(runtime.config):
+        return None
+    response = await asyncio.to_thread(
+        runtime.gmail.watch_mailbox,
+        runtime.config.gmail_push_topic,
+        runtime.config.gmail_monitor_labels,
+    )
+    expiration = str(response.get("expiration") or "")
+    history_id = str(response.get("historyId") or "")
+    if expiration:
+        runtime.store.set_bot_state(GMAIL_WATCH_EXPIRATION_KEY, expiration)
+    if history_id and (reset_history_id or not runtime.store.get_bot_state(GMAIL_HISTORY_ID_KEY)):
+        runtime.store.set_bot_state(GMAIL_HISTORY_ID_KEY, history_id)
+    return response
+
+
+async def recover_gmail_push_history(
+    runtime: Runtime,
+    application: Application,
+) -> str | None:
+    recent_ids = await asyncio.to_thread(
+        runtime.gmail.list_recent_monitored_ids,
+        runtime.config.gmail_monitor_labels,
+    )
+    last_seen = runtime.store.get_bot_state(LAST_SEEN_KEY)
+    unseen_ids, newest_seen = split_unseen_inbox_ids(recent_ids, last_seen)
+    for gmail_message_id in unseen_ids:
+        await process_new_email(application, runtime, gmail_message_id)
+    if newest_seen:
+        runtime.store.set_bot_state(LAST_SEEN_KEY, newest_seen)
+    watch_response = await ensure_gmail_push_watch(runtime, reset_history_id=True)
+    if watch_response and watch_response.get("historyId"):
+        return str(watch_response["historyId"])
+    return runtime.store.get_bot_state(GMAIL_HISTORY_ID_KEY)
+
+
+async def handle_gmail_push_notification(
+    runtime: Runtime,
+    application: Application,
+    payload: Mapping[str, Any],
+) -> dict:
+    if not gmail_push_ready(runtime.config):
+        raise ConfigError("Gmail push is not configured yet")
+
+    incoming_history_id = str(payload.get("historyId") or "").strip()
+    if not incoming_history_id:
+        raise ConfigError("Missing Gmail historyId")
+
+    async with runtime_gmail_push_lock(runtime):
+        current_history_id = runtime.store.get_bot_state(GMAIL_HISTORY_ID_KEY)
+        if not current_history_id:
+            runtime.store.set_bot_state(GMAIL_HISTORY_ID_KEY, incoming_history_id)
+            return {"status": "primed", "historyId": incoming_history_id, "processed": 0}
+
+        try:
+            history_payload = await asyncio.to_thread(
+                runtime.gmail.list_history,
+                current_history_id,
+                label_ids=runtime.config.gmail_monitor_labels,
+                history_types=["messageAdded"],
+            )
+        except HttpError as exc:
+            if gmail_http_status(exc) == 404:
+                LOGGER.warning("Gmail historyId expired. Performing full sync recovery.")
+                recovered_history_id = await recover_gmail_push_history(runtime, application)
+                return {
+                    "status": "recovered",
+                    "historyId": recovered_history_id or incoming_history_id,
+                    "processed": 0,
+                }
+            raise
+
+        history_rows = history_payload.get("history") or []
+        processed_ids: List[str] = []
+        for gmail_message_id in extract_history_message_ids(history_rows):
+            payload_full = await asyncio.to_thread(runtime.gmail.get_full_message, gmail_message_id)
+            if not message_matches_monitored_labels(payload_full, runtime.config.gmail_monitor_labels):
+                continue
+            await process_new_email(application, runtime, gmail_message_id, payload=payload_full)
+            processed_ids.append(gmail_message_id)
+        if processed_ids:
+            runtime.store.set_bot_state(LAST_SEEN_KEY, processed_ids[-1])
+        next_history_id = str(history_payload.get("historyId") or incoming_history_id)
+        runtime.store.set_bot_state(GMAIL_HISTORY_ID_KEY, next_history_id)
+        return {"status": "ok", "historyId": next_history_id, "processed": len(processed_ids)}
+
+
 EDITABLE_DASHBOARD_FIELDS = [
     DashboardField(
         key="PUBLIC_BASE_URL",
@@ -2765,6 +3051,21 @@ EDITABLE_DASHBOARD_FIELDS = [
         label="Watch interval (seconds)",
         kind="number",
         help_text="Polling delay between Gmail inbox checks.",
+    ),
+    DashboardField(
+        key="GMAIL_PUSH_TOPIC",
+        attr="gmail_push_topic",
+        label="Gmail push topic",
+        kind="text",
+        help_text="Pub/Sub topic used for Gmail push notifications. Example: projects/my-project/topics/glassyreply-mail.",
+    ),
+    DashboardField(
+        key="GMAIL_PUSH_WEBHOOK_SECRET",
+        attr="gmail_push_webhook_secret",
+        label="Gmail push webhook secret",
+        kind="password",
+        secret=True,
+        help_text="Secret appended to /gmail/push so Fly can wake on inbound Gmail Pub/Sub deliveries.",
     ),
     DashboardField(
         key="LANG",
@@ -3933,6 +4234,45 @@ async def handle_settings_callback(
         )
         await query.answer()
         return True
+    if action == "gmail_push_topic":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text=(
+                "Rispondi con il topic Pub/Sub per Gmail Push. "
+                "Esempio: projects/my-project/topics/glassyreply-mail"
+            ),
+            action_kind="setup_gmail_push_topic",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
+    if action == "gmail_push_secret":
+        await prompt_for_setup_value(
+            context,
+            runtime,
+            prompt_text=(
+                "Rispondi con un secret casuale per /gmail/push. "
+                "Lo userai anche nella push subscription Pub/Sub."
+            ),
+            action_kind="setup_gmail_push_secret",
+            reply_to_message_id=query.message.message_id,
+        )
+        await query.answer()
+        return True
+    if action == "gmail_push_refresh":
+        if not gmail_push_ready(runtime.config):
+            await query.answer("Config Gmail push incompleta.", show_alert=True)
+            return True
+        try:
+            await ensure_gmail_push_watch(runtime, reset_history_id=not bool(runtime.store.get_bot_state(GMAIL_HISTORY_ID_KEY)))
+        except Exception as exc:
+            LOGGER.exception("Manual Gmail push refresh failed.")
+            await query.answer(f"Push err: {exc}", show_alert=True)
+            return True
+        await safe_edit(query.message, text=settings_message_text(runtime), markup=settings_keyboard(runtime))
+        await query.answer("Watch Gmail rinnovata")
+        return True
     if action == "pixel_base_url":
         await prompt_for_setup_value(
             context,
@@ -4041,6 +4381,18 @@ async def txt_followup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     raise ConfigError("Serve una timezone IANA testuale.")
                 save_runtime_settings(runtime, {"TIMEZONE": raw_text})
                 await send_settings_message(message, runtime, "Timezone salvata.")
+                return
+            if interactive.action_kind == "setup_gmail_push_topic":
+                if not raw_text:
+                    raise ConfigError("Serve un topic Pub/Sub testuale.")
+                save_runtime_settings(runtime, {"GMAIL_PUSH_TOPIC": raw_text})
+                await send_settings_message(message, runtime, "Gmail push topic salvato.")
+                return
+            if interactive.action_kind == "setup_gmail_push_secret":
+                if not raw_text:
+                    raise ConfigError("Serve un secret testuale.")
+                save_runtime_settings(runtime, {"GMAIL_PUSH_WEBHOOK_SECRET": raw_text})
+                await send_settings_message(message, runtime, "Gmail push secret salvato.")
                 return
             if interactive.action_kind == "setup_pixel_base_url":
                 save_runtime_settings(runtime, {"PIXEL_BASE_URL": raw_text})
@@ -4371,11 +4723,18 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer(f"Err: {exc}", show_alert=True)
 
 
-async def process_new_email(application: Application, runtime: Runtime, gmail_message_id: str) -> None:
+async def process_new_email(
+    application: Application,
+    runtime: Runtime,
+    gmail_message_id: str,
+    *,
+    payload: dict | None = None,
+) -> None:
     if not owner_configured(runtime.config):
         return
     lang = runtime.config.lang
-    payload = await asyncio.to_thread(runtime.gmail.get_full_message, gmail_message_id)
+    if payload is None:
+        payload = await asyncio.to_thread(runtime.gmail.get_full_message, gmail_message_id)
     message_payload = payload["payload"]
     headers = message_payload.get("headers", [])
     subject = decode_hdr(extract_header(headers, "subject", "(senza oggetto)")) or "(senza oggetto)"
@@ -4419,32 +4778,63 @@ async def process_new_email(application: Application, runtime: Runtime, gmail_me
     await safe_edit(tg_message, markup=kb_main(state.tg_message_id, state.starred, attachments))
 
 
+async def bootstrap_gmail_mailbox(runtime: Runtime, application: Application) -> str | None:
+    last_seen = runtime.store.get_bot_state(LAST_SEEN_KEY)
+    if last_seen:
+        return last_seen
+    if not gmail_ready_for_watch(runtime.config):
+        return None
+    try:
+        recent_ids = await asyncio.to_thread(
+            runtime.gmail.list_recent_monitored_ids,
+            runtime.config.gmail_monitor_labels,
+            1,
+        )
+        if recent_ids:
+            if gmail_initial_sync_pending(runtime):
+                await process_new_email(application, runtime, recent_ids[0])
+                clear_gmail_initial_sync_pending(runtime)
+            last_seen = recent_ids[0]
+            runtime.store.set_bot_state(LAST_SEEN_KEY, last_seen)
+    except Exception:
+        LOGGER.exception("Initial Gmail watcher bootstrap failed.")
+        return None
+    return last_seen
+
+
 async def watcher(runtime: Runtime, application: Application) -> None:
     if not gmail_ready_for_watch(runtime.config):
         LOGGER.info("Watcher waiting for owner/Gmail setup.")
-    last_seen = runtime.store.get_bot_state(LAST_SEEN_KEY)
-    if not last_seen and gmail_ready_for_watch(runtime.config):
-        try:
-            recent_ids = await asyncio.to_thread(
-                runtime.gmail.list_recent_monitored_ids,
-                runtime.config.gmail_monitor_labels,
-                1,
-            )
-            if recent_ids:
-                if gmail_initial_sync_pending(runtime):
-                    await process_new_email(application, runtime, recent_ids[0])
-                    clear_gmail_initial_sync_pending(runtime)
-                last_seen = recent_ids[0]
-                runtime.store.set_bot_state(LAST_SEEN_KEY, last_seen)
-        except Exception:
-            LOGGER.exception("Initial Gmail watcher bootstrap failed.")
-            last_seen = None
+    last_seen = await bootstrap_gmail_mailbox(runtime, application)
 
     while not runtime.shutdown_event.is_set():
+        stored_last_seen = runtime.store.get_bot_state(LAST_SEEN_KEY)
+        if stored_last_seen != last_seen:
+            last_seen = stored_last_seen
         if not gmail_ready_for_watch(runtime.config):
             try:
                 interval = max(1, int(runtime.config.watch_interval))
                 await asyncio.wait_for(runtime.shutdown_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+            continue
+        if gmail_push_ready(runtime.config):
+            try:
+                if gmail_push_should_renew(runtime):
+                    async with runtime_gmail_push_lock(runtime):
+                        await ensure_gmail_push_watch(
+                            runtime,
+                            reset_history_id=not bool(runtime.store.get_bot_state(GMAIL_HISTORY_ID_KEY)),
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("Gmail push watch renewal failed.")
+            try:
+                await asyncio.wait_for(
+                    runtime.shutdown_event.wait(),
+                    timeout=GMAIL_PUSH_LOOP_INTERVAL_SECONDS,
+                )
             except asyncio.TimeoutError:
                 continue
             continue
@@ -4507,7 +4897,14 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
 
     @app.get("/healthz")
     async def healthz():
-        return jsonify({"status": "ok", "mode": runtime.mode})
+        return jsonify(
+            {
+                "status": "ok",
+                "mode": runtime.mode,
+                "gmail_push_ready": gmail_push_ready(runtime.config),
+                "gmail_push_topic": bool(runtime.config.gmail_push_topic),
+            }
+        )
 
     @app.get("/config")
     @app.get("/dashboard")
@@ -4659,6 +5056,22 @@ def create_web_app(runtime: Runtime, application: Application) -> Quart:
             return jsonify({"status": "error", "message": str(exc)}), 400
         except Exception as exc:
             LOGGER.exception("Pixel webhook update failed.")
+            return jsonify({"status": "error", "message": str(exc)}), 500
+
+    @app.post("/gmail/push")
+    async def gmail_push():
+        secret = request.args.get("secret") or request.headers.get("X-Gmail-Push-Secret")
+        if not gmail_push_secret_matches(runtime.config, secret):
+            return jsonify({"status": "unauthorized"}), 401
+        body = await request.get_json(silent=True) or {}
+        try:
+            payload = decode_pubsub_push_payload(body)
+            result = await handle_gmail_push_notification(runtime, application, payload)
+            return jsonify(result), 200
+        except ConfigError as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 400
+        except Exception as exc:
+            LOGGER.exception("Gmail push webhook failed.")
             return jsonify({"status": "error", "message": str(exc)}), 500
 
     @app.post("/telegram/webhook")

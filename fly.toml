@@ -19,8 +19,8 @@ primary_region = "fra"
   internal_port = 8080
   force_https = true
   auto_start_machines = true
-  # Warning: with the current Gmail polling runtime, suspend/stop means the bot
-  # will wake on HTTP traffic, not on inbound Gmail messages themselves.
+  # With Gmail Push configured, Pub/Sub hits /gmail/push and wakes the machine
+  # on inbound mailbox activity. Without it, suspend wakes only on normal HTTP traffic.
   auto_stop_machines = "suspend"
   min_machines_running = 0
 
