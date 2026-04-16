@@ -1,5 +1,5 @@
-# GlassyReply
-
+![Logo](GLASSYREPLY.png)
+----
 GlassyReply is a Telegram bot for one-user Gmail triage and AI-assisted replies.
 
 It watches Gmail, forwards each new inbox message to Telegram, streams a Gemini draft reply, and lets you send, save draft, trash, star, label, forward, and download attachments from inline keyboards. It also exposes a public landing page, a private Telegram-signed config dashboard, and an optional multilayer tracking pipeline for outbound HTML replies.
@@ -21,22 +21,6 @@ It watches Gmail, forwards each new inbox message to Telegram, streams a Gemini 
                     | /track/* self-hosted    |
                     +-------------------------+
 ```
-
-## What changed in this hardening pass
-
-- SQLite replaced in-memory bot state.
-- Gmail API calls now self-heal on `401/403` by rebuilding the client and retrying once.
-- Telegram access is locked to the claimed owner user ID.
-- Configuration is centralized in `Config.from_env()`.
-- Runtime config is persisted in SQLite and edited from the dashboard, not by hand in `.env`.
-- The first Telegram `/start` can claim the bot owner, and `/setup` can finish most of the configuration in-chat.
-- Bot runtime supports `--mode polling` and `--mode webhook`.
-- Docker, Docker Compose, Fly.io config, tests, and first-run docs were added.
-- Pixel tracking moved from a single raw image URL to a signed multilayer bundle:
-  - primary `img` beacon
-  - CSS background-image beacon
-  - dark-mode CSS beacon
-  - experimental font beacon
 
 ## Requirements
 
