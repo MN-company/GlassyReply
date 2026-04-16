@@ -26,7 +26,10 @@ from tg_email import (
     build_candidate_config,
     build_application,
     claim_owner,
+    append_tracking_to_raw,
+    build_raw,
     create_web_app,
+    draft_headers_from_raw,
     gmail_initial_sync_pending,
     help_message_text,
     google_oauth_state_payload,
@@ -317,15 +320,16 @@ class StateStoreTests(unittest.TestCase):
                 last_confidence=None,
             )
             store.upsert_tracked_email(tracked)
-            updated = store.record_pixel_event(
-                tg_message_id=301,
-                classification="human_browser",
-                layer="font",
-                dimensions="2x1",
-                confidence=0.91,
-                is_user_open=True,
-                email_subject="Hello",
-            )
+            with patch("tg_email.utcnow_iso", return_value="2026-04-15T08:19:00+00:00"):
+                updated = store.record_pixel_event(
+                    tg_message_id=301,
+                    classification="human_browser",
+                    layer="font",
+                    dimensions="2x1",
+                    confidence=0.91,
+                    is_user_open=True,
+                    email_subject="Hello",
+                )
 
             self.assertIsNotNone(updated)
             assert updated is not None
@@ -768,6 +772,21 @@ class EmailRenderingTests(unittest.TestCase):
         self.assertIn("proxy-revalidate", response.headers["cache-control"])
         self.assertEqual(response.headers["pragma"], "no-cache")
         self.assertEqual(response.headers["surrogate-control"], "no-store")
+
+    def test_append_tracking_to_raw_adds_markup_without_changing_headers(self) -> None:
+        original_raw = build_raw(
+            "lead@example.com",
+            "Tracked subject",
+            "Body text",
+            include_html_alternative=True,
+        )
+
+        updated_raw = append_tracking_to_raw(original_raw, "<img src=\"https://tracker.example/p.png\">")
+        subject, recipient = draft_headers_from_raw(updated_raw)
+
+        self.assertEqual(subject, "Tracked subject")
+        self.assertEqual(recipient, "lead@example.com")
+        self.assertIn("tracker.example/p.png", base64.urlsafe_b64decode(updated_raw + "=" * (-len(updated_raw) % 4)).decode("utf-8", "replace"))
 
 
 class WebAppSmokeTests(unittest.TestCase):

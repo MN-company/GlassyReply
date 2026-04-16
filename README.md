@@ -316,6 +316,13 @@ The token must be signed by the bot, so the easiest real test is still:
 3. open/send the draft from Gmail
 4. watch `Stats` in Telegram update
 
+Tracked draft note:
+
+- outbound tracked emails now start as clean Gmail drafts without active remote beacons
+- finish editing and let Gmail save the draft
+- then press `📨 Invia con tracking` in Telegram
+- this avoids counting your own Gmail draft editing as an open event
+
 ### Optional Cloudflare Worker mode
 
 Cloudflare is no longer required. The Worker remains optional if you specifically want a separate edge-hosted tracker.

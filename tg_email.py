@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import base64
 import email
+from email import policy
 import hashlib
 import hmac
 import html as ihtml
@@ -76,6 +77,10 @@ TRACKED_DRAFT_SUBJECT_KEY = "tracked_draft_subject"
 MENU_TRACKED_EMAIL = "Email Tracciata"
 MENU_STATS = "Stats"
 MENU_SETTINGS = "Impostazioni"
+TRACKED_DRAFT_EDITOR_NOTE = (
+    "Bozza pronta da completare in Gmail. Quando hai finito e Gmail ha salvato le modifiche, premi "
+    "📨 Invia con tracking qui su Telegram."
+)
 TRACKING_SESSION_WINDOW_SECONDS = 90
 DEFAULT_TIMEZONE_BY_LANG = {
     "it": "Europe/Rome",
@@ -1057,6 +1062,25 @@ class StateStore:
                 (int(starred), utcnow_iso(), tg_message_id),
             )
 
+    def update_tracked_draft_reference(
+        self,
+        tg_message_id: int,
+        *,
+        draft_id: str | None = None,
+        recipient: str | None = None,
+        subject: str | None = None,
+    ) -> None:
+        tracked = self.get_tracked_email(tg_message_id)
+        if tracked is None:
+            return
+        updated = replace(
+            tracked,
+            draft_id=tracked.draft_id if draft_id is None else draft_id,
+            recipient=tracked.recipient if recipient is None else recipient,
+            subject=tracked.subject if subject is None else subject,
+        )
+        self.upsert_tracked_email(updated)
+
     def add_pending_action(self, prompt_message_id: int, root_tg_message_id: int, action_kind: str) -> None:
         with self._lock, self._conn:
             self._conn.execute(
@@ -1374,6 +1398,23 @@ class GmailClient:
             .execute()
         )
 
+    def get_draft_raw(self, draft_id: str) -> str:
+        payload = self.call(
+            lambda svc: svc.users()
+            .drafts()
+            .get(userId="me", id=draft_id, format="raw")
+            .execute()
+        )
+        return str((payload or {}).get("message", {}).get("raw") or "")
+
+    def delete_draft(self, draft_id: str) -> None:
+        self.call(
+            lambda svc: svc.users()
+            .drafts()
+            .delete(userId="me", id=draft_id)
+            .execute()
+        )
+
     def modify_message(self, gmail_message_id: str, add: List[str] | None = None, rem: List[str] | None = None) -> None:
         self.call(
             lambda svc: svc.users()
@@ -1610,16 +1651,84 @@ def extract_header(headers: List[dict], name: str, default: str = "") -> str:
     return match if match is not None else default
 
 
-def build_raw(to_addr: str, subject: str, plain: str, tracking_markup: str | None = None) -> str:
+def build_raw(
+    to_addr: str,
+    subject: str,
+    plain: str,
+    tracking_markup: str | None = None,
+    *,
+    include_html_alternative: bool = False,
+) -> str:
     message = email.message.EmailMessage()
     message["To"] = to_addr
     message["Subject"] = subject
     message.set_content(plain)
-    if tracking_markup:
+    if include_html_alternative or tracking_markup:
         html_body = ihtml.escape(plain).replace("\n", "<br>")
-        html_body += tracking_markup
+        if tracking_markup:
+            html_body += tracking_markup
         message.add_alternative(html_body, subtype="html")
     return base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+
+def parse_raw_email_message(raw: str) -> email.message.EmailMessage:
+    decoded = b64url_decode(raw)
+    parsed = email.message_from_bytes(decoded, policy=policy.default)
+    if not isinstance(parsed, email.message.EmailMessage):
+        raise ConfigError("Draft MIME payload is invalid.")
+    return parsed
+
+
+def encode_raw_email_message(message: email.message.EmailMessage) -> str:
+    return base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+
+def append_tracking_to_raw(raw: str, tracking_markup: str) -> str:
+    message = parse_raw_email_message(raw)
+    html_part: email.message.EmailMessage | None = None
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+        if part.get_content_type() == "text/html":
+            html_part = part
+            break
+
+    if html_part is None:
+        plain_text = ""
+        for part in message.walk():
+            if part.is_multipart():
+                continue
+            if part.get_content_type() == "text/plain":
+                plain_text = part.get_content()
+                break
+        if message.is_multipart():
+            html_part = email.message.EmailMessage()
+            html_part.set_content(
+                ihtml.escape(plain_text).replace("\n", "<br>") + tracking_markup,
+                subtype="html",
+                charset="utf-8",
+            )
+            message.attach(html_part)
+        else:
+            body_text = message.get_content()
+            message.set_content(body_text)
+            message.add_alternative(
+                ihtml.escape(body_text).replace("\n", "<br>") + tracking_markup,
+                subtype="html",
+            )
+        return encode_raw_email_message(message)
+
+    html_body = html_part.get_content()
+    if tracking_markup not in html_body:
+        html_body += tracking_markup
+        charset = html_part.get_content_charset() or "utf-8"
+        html_part.set_content(html_body, subtype="html", charset=charset)
+    return encode_raw_email_message(message)
+
+
+def draft_headers_from_raw(raw: str) -> tuple[str, str]:
+    message = parse_raw_email_message(raw)
+    return decode_hdr(message.get("Subject") or ""), parseaddr(message.get("To") or "")[1].strip()
 
 
 def tracked_email_enabled(config: Config) -> bool:
@@ -2361,6 +2470,19 @@ def stats_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("Nuova email tracciata", callback_data="tracked|new"),
         ]]
     )
+
+
+def tracked_email_keyboard(tracked: TrackedEmail) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    if tracked.draft_id:
+        rows.append([InlineKeyboardButton("📨 Invia con tracking", callback_data=f"tracked|send|{tracked.tg_message_id}")])
+    rows.append(
+        [
+            InlineKeyboardButton("Aggiorna", callback_data="stats|refresh"),
+            InlineKeyboardButton("Nuova email tracciata", callback_data="tracked|new"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def setup_message_text(runtime: Runtime) -> str:
@@ -3441,8 +3563,12 @@ async def create_tracked_draft(
         text="🛰️ Creo la bozza tracciata…",
         parse_mode=ParseMode.HTML,
     )
-    tracking_markup = build_tracking_markup_for_message_id(runtime.config, placeholder.message_id)
-    raw = build_raw(recipient, subject, localized_manual_reply_placeholder(runtime.config.lang), tracking_markup)
+    raw = build_raw(
+        recipient,
+        subject,
+        localized_manual_reply_placeholder(runtime.config.lang),
+        include_html_alternative=True,
+    )
     try:
         draft_payload = await asyncio.to_thread(runtime.gmail.create_draft, raw, "")
     except Exception as exc:
@@ -3468,8 +3594,45 @@ async def create_tracked_draft(
     )
     runtime.store.upsert_tracked_email(tracked)
     runtime.store.purge_old_rows(runtime.config.state_retention_days)
-    note = "Bozza creata. Apri Gmail > Drafts, completa il testo e inviala."
-    await safe_edit(placeholder, text=format_tracked_email_text(tracked, runtime.config, note=note), markup=stats_keyboard())
+    await safe_edit(
+        placeholder,
+        text=format_tracked_email_text(tracked, runtime.config, note=TRACKED_DRAFT_EDITOR_NOTE),
+        markup=tracked_email_keyboard(tracked),
+    )
+
+
+async def send_tracked_draft_from_telegram(
+    context: ContextTypes.DEFAULT_TYPE,
+    runtime: Runtime,
+    tg_message_id: int,
+    message,
+) -> None:
+    tracked = runtime.store.get_tracked_email(tg_message_id)
+    if tracked is None:
+        raise ConfigError("Bozza tracciata non trovata.")
+    if not tracked.draft_id:
+        raise ConfigError("Questa bozza risulta gia' inviata o non disponibile.")
+
+    raw = await asyncio.to_thread(runtime.gmail.get_draft_raw, tracked.draft_id)
+    if not raw:
+        raise ConfigError("Gmail non ha restituito il contenuto della bozza.")
+    tracking_markup = build_tracking_markup_for_message_id(runtime.config, tg_message_id)
+    final_raw = append_tracking_to_raw(raw, tracking_markup)
+    subject, recipient = draft_headers_from_raw(final_raw)
+    await asyncio.to_thread(runtime.gmail.send_raw_message, final_raw, "")
+    try:
+        await asyncio.to_thread(runtime.gmail.delete_draft, tracked.draft_id)
+    except Exception:
+        LOGGER.exception("Failed to delete tracked draft after send.")
+    runtime.store.update_tracked_draft_reference(
+        tg_message_id,
+        draft_id="",
+        recipient=recipient or tracked.recipient,
+        subject=subject or tracked.subject,
+    )
+    updated = runtime.store.get_tracked_email(tg_message_id) or tracked
+    note = "Email inviata con tracking. L'editing della bozza in Gmail non conta come apertura."
+    await safe_edit(message, text=format_tracked_email_text(updated, runtime.config, note=note), markup=stats_keyboard())
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4033,9 +4196,24 @@ async def cb_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer()
         return
     if action == "tracked":
-        if query.message is not None:
+        subaction = parts[1] if len(parts) > 1 else "new"
+        if subaction == "new" and query.message is not None:
             await begin_tracked_email_flow(query.message, context, runtime)
-        await query.answer()
+            await query.answer()
+            return
+        if subaction == "send":
+            if len(parts) < 3 or query.message is None:
+                await query.answer("Bozza mancante", show_alert=True)
+                return
+            try:
+                await send_tracked_draft_from_telegram(context, runtime, int(parts[2]), query.message)
+            except Exception as exc:
+                LOGGER.exception("Tracked draft send failed.")
+                await query.answer(f"Err: {exc}", show_alert=True)
+                return
+            await query.answer("Email inviata")
+            return
+        await query.answer("Unsupported", show_alert=True)
         return
     tg_message_id = int(parts[1])
     state = runtime.store.get_email_state(tg_message_id)

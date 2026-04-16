@@ -19,8 +19,10 @@ primary_region = "fra"
   internal_port = 8080
   force_https = true
   auto_start_machines = true
-  auto_stop_machines = "off"
-  min_machines_running = 1
+  # Warning: with the current Gmail polling runtime, suspend/stop means the bot
+  # will wake on HTTP traffic, not on inbound Gmail messages themselves.
+  auto_stop_machines = "suspend"
+  min_machines_running = 0
 
   [[http_service.checks]]
     grace_period = "20s"
@@ -28,4 +30,3 @@ primary_region = "fra"
     method = "GET"
     path = "/healthz"
     timeout = "5s"
-
