@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.*
+.pytest_cache
+.ruff_cache
+.wrangler
+node_modules
+__pycache__
+*.py[cod]
+data
+output
+token.json
+credentials.json

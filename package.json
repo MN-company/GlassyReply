@@ -1,0 +1,9 @@
+{
+  "name": "glassyreply",
+  "private": true,
+  "scripts": {
+    "worker:dev": "npx wrangler dev",
+    "worker:check": "npx wrangler deploy --dry-run",
+    "pixel:test": "python3 scripts/pixel_smoke_test.py"
+  }
+}

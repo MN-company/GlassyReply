@@ -1,0 +1,32 @@
+app = "glassyreply-bot"
+primary_region = "fra"
+
+[build]
+
+[env]
+  DATA_DIR = "/app/data"
+  STATE_DB_PATH = "/app/data/state.db"
+  GMAIL_TOKEN_PATH = "/app/data/token.json"
+  GMAIL_CREDENTIALS_PATH = "/app/data/credentials.json"
+  HOST = "0.0.0.0"
+  PORT = "8080"
+
+[[mounts]]
+  source = "data"
+  destination = "/app/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  # With Gmail Push configured, Pub/Sub hits /gmail/push and wakes the machine
+  # on inbound mailbox activity. Without it, suspend wakes only on normal HTTP traffic.
+  auto_stop_machines = "suspend"
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    grace_period = "20s"
+    interval = "15s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
